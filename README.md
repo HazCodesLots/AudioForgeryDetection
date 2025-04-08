@@ -1,12 +1,12 @@
 This Repository contains the implementation of Replay and Synthetic Speech Detection with Res2Net Architecture (https://arxiv.org/abs/2010.15006)<br>
 Dataset utilized for training the model was a subset of 2000 files from the HAD dataset (https://arxiv.org/abs/2104.03617)<br>
-I have studied the papers and their implementations mentioned below and have highlighted their merits and demerits based on the best my understanding.<br>
+I have studied the papers and their implementations mentioned below and have highlighted their merits and demerits to the best of my understanding.<br>
 
 # Res2Net50
 **The research paper Replay and Synthetic Speech Detection with Res2Net Architecture was more accessible to me than others due to my background in neural networks. Many of its concepts were easier for me to grasp, making the implementation more , well easier. Additionally, I incorporated training methods from previous models I’ve worked on, as they align with my understanding of visual pattern recognition and computer vision through deep learning.** <br>
 # Technical Explaination of the model
 This Res2net50 model processes audio files into mel-spectrograms, analyzes the patterns to classify if the audio is AI generated or genuine one from a human being. ResNet stands for residual networks designed to train and address neural networks. This is done through adding additional layers for different tasks. The resultant is a diverse net that can handle more complex operations. Res2Net50 exlusively performs well with its mutli-layer feature extraction making it effective in judging intricate patterns.<br> 
-Due to hardware and time limitations, I cropped the dataset from 53,000 audio files to 2000 audio files for training. I used Adam optimizer for Optimization, cross entropy for perforamce as I have used these utilities to train images before. I tested the model on 5-6 randomly picked audio files and it performed well in my opinion. I did not consider more files as the assessment asked me not to. This project is based on Pytorch.<br>
+Due to hardware and time limitations, I cropped the dataset from 53,000 audio files to 2000 audio files for training. I used Adam optimizer for Optimization, cross entropy for perforamce as I have used these utilities to train images before. I tested the model on 5-6 randomly picked audio files and it performed well in my opinion. This project is based on Pytorch.<br>
 I am not sure on how we can extend this model on a larger scale as I have never worked with bigger machines than my laptop so my knowledge is limited in this field. I feel like combining certain parts of other models can greatly benefit the Res2Net50. The paper suggests utilization of CQT to get resolution results at lower frequencies. I also believe combining raw-waveform input can speed up this process as mentioned in the AASIST paper but I am not sure how it can be integrated in this model.
 
 # Challenges Encountered  
