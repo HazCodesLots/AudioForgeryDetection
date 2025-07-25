@@ -1,7 +1,7 @@
 <b>ResNet Reference paper<b> - https://arxiv.org/abs/2010.15006<br>
 <b>AASIST Reference paper<b> - https://arxiv.org/abs/2110.01200<br>
 
-<details>
+<details open>
   <summary><b>AASIST</b></summary>
 <h2>AASIST: Automated Anti-Spoofing for ASVspoof2021 LA Eval</h2>
 
