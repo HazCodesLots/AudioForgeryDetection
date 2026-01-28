@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+import math
 from torch.optim import Adam, AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau
 from sklearn.metrics import roc_curve
@@ -13,6 +14,14 @@ import json
 from datetime import datetime
 from typing import Tuple, Optional
 import random
+try:
+    import torchaudio
+except ImportError:
+    torchaudio = None
+except OSError:
+    torchaudio = None
+import pandas as pd
+from pathlib import Path
 
 
 
@@ -51,96 +60,109 @@ class KANLayer(nn.Module):
         grid = torch.linspace(theta_1, theta_2, self.num_grid_points)
         return grid
 
-    def _compute_bspline_basis(self, x):
-        x = x.unsqueeze(-1)
+    def _compute_bspline_basis(self, x: torch.Tensor):
+        """
+        Vectorized computation of B-spline bases using De Boor's recursion.
+        Significantly faster than nested loops.
+        """
+        # x: [..., in_features]
+        # grid: [num_grid_points]
+        x = x.unsqueeze(-1) # [..., in_features, 1]
         grid = self.grid
-        num_coeffs = self.grid_size + self.spline_order
+        
+        # Initial bases (k=0)
+        # bases: [..., in_features, num_grid_points - 1]
+        bases = ((x >= grid[:-1]) & (x < grid[1:])).float()
+        
+        # Recursive calculation (k=1 to spline_order)
+        for k in range(1, self.spline_order + 1):
+            # Left term
+            # grid[:-k-1] is t_i, grid[k:-1] is t_{i+k}
+            left_den = grid[k:-1] - grid[:-k-1]
+            left_term = ((x - grid[:-k-1]) / left_den) * bases[..., :-1]
+            
+            # Right term
+            # grid[1:-k] is t_{i+1}, grid[k+1:] is t_{i+k+1}
+            right_den = grid[k+1:] - grid[1:-k]
+            right_term = ((grid[k+1:] - x) / right_den) * bases[..., 1:]
+            
+            bases = left_term + right_term
+            
+        return bases.contiguous()
 
-        bases = []
+    def _prelu(self, x: torch.Tensor):
+        # x: [..., in_features]
+        # self.prelu_weight: [out_features, in_features]
+        # output: [out_features, ..., in_features]
+        
+        # Simplified and vectorized PReLU
+        # We want to apply different weight per (in_feature, out_feature) pair
+        # Formula: pos(x) + weight * neg(x)
+        
+        pos = F.relu(x)
+        neg = x - pos
+        
+        # We use einsum to handle the broadcasting efficiently
+        # i: out_features, j: in_features, ...: batch/time dims
+        # weight(ij), x(...j) -> output(i...j)
+        return torch.einsum('ij,...j->i...j', self.prelu_weight, neg) + pos.unsqueeze(0)
 
-        for i in range(num_coeffs):
-
-            mask = (x >= grid[i]) & (x < grid[i + 1])
-            basis = mask.float()
-
-            for k in range(1, self.spline_order + 1):
-                left_den = grid[i + k] - grid[i]
-                if left_den > 1e-8:
-                    left_term = ((x - grid[i]) / left_den) * basis
-                else:
-                    left_term = torch.zeros_like(basis)
-
-                if i + k + 1 < len(grid):
-                    right_den = grid[i + k + 1] - grid[i + 1]
-                    if right_den > 1e-8:
-                        next_mask = (x >= grid[i + 1]) & (x < grid[i + k + 1])
-                        next_basis = next_mask.float()
-                        right_term = ((grid[i + k + 1] - x) / right_den) * next_basis
-                    else:
-                        right_term = torch.zeros_like(basis)
-                else:
-                    right_term = torch.zeros_like(basis)
-
-                basis = left_term + right_term
-
-            bases.append(basis)
-
-        return torch.cat(bases, dim=-1)
-
-    def _prelu(self, x):
-
-        x_expanded = x.unsqueeze(0)
-        pos = F.relu(x_expanded)
-        neg = torch.min(x_expanded, torch.zeros_like(x_expanded))
-
-        prelu_weight = self.prelu_weight.view(self.out_features, *([1] * x.dim()), self.in_features)
-        return pos + prelu_weight * neg
-
-    def forward(self, x):
+    def forward(self, x: torch.Tensor):
+        # x: [..., in_features]
         batch_shape = x.shape[:-1]
-
         x_clamped = torch.clamp(x, self.grid_range[0], self.grid_range[1])
 
+        # 1. Base path (PReLU)
+        # base_output: [out_features, ..., in_features]
         base_output = self._prelu(x_clamped)
 
+        # 2. Spline path
+        # bspline_basis: [..., in_features, num_coeffs]
         bspline_basis = self._compute_bspline_basis(x_clamped)
 
-        coeffs_exp = self.spline_coeffs.view(self.out_features, *([1] * len(batch_shape)), self.in_features, -1)
+        # spline_coeffs: [out_features, in_features, num_coeffs]
+        # We want to multiply each (in_feature, num_coeff) with its corresponding weight
+        # and sum over num_coeffs.
+        # i: out_features, j: in_features, k: num_coeffs, ...: batch dims
+        # spline_coeffs(ijk), bspline_basis(...jk) -> spline_output(i...j)
+        spline_output = torch.einsum('ijk,...jk->i...j', self.spline_coeffs, bspline_basis)
+
+        # 3. Final weighted sum
+        # output = base_w * base_output + spline_w * spline_output
+        # then sum over in_features (j)
+        # base_w: [out_features, in_features]
+        # spline_w: [out_features, in_features]
         
-        basis_exp = bspline_basis.unsqueeze(0)
+        # Final output(i...) = sum_j (base_w(ij)*base_output(i...j) + spline_w(ij)*spline_output(i...j))
+        output = torch.einsum('ij,i...j->i...', self.base_weight, base_output) + \
+                 torch.einsum('ij,i...j->i...', self.spline_weight, spline_output)
 
-        spline_output = (coeffs_exp * basis_exp).sum(dim=-1)
-
-        base_w =  self.base_weight.view(self.out_features, *([1] * len(batch_shape)), self.in_features)
-        spline_w = self.spline_weight.view(self.out_features, *([1]* len(batch_shape)), self.in_features)
-
-        output = base_w * base_output + spline_w * spline_output
-        output = output.sum(dim=-1)
-        output = output.permute(*range(1, len(output.shape)), 0)
-
-        return output
+        # Transpose back: [out_features, ...] -> [..., out_features]
+        # move dim 0 to the end
+        dims = list(range(1, output.dim())) + [0]
+        return output.permute(*dims).contiguous()
 
 
-class PreEmphasis(nn.Module:):
+class PreEmphasis(nn.Module):
     def __init__(self, coef=0.97):
         super(PreEmphasis, self).__init__()
         self.coef = coef
         self.register_buffer('flipped_filter', torch.FloatTensor([-self.coef, 1.0]).unsqueeze(0).unsqueeze(0))
 
-        def forward(self, x: torch.Tensor) -> torch.Tensor:
-            if x.dim() == 2:
-                x = x.unsqueeze(1)
-                squeeze_output = True
-            else:
-                squeeze_output = False
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() == 2:
+            x = x.unsqueeze(1)
+            squeeze_output = True
+        else:
+            squeeze_output = False
 
-            x_padded = torch.nn.functional.pad(x, (1, 0), mode='replicate')
-            x_preemphasized = torch.nn.functional.conv1d(x_padded, self.flipped_filter)
+        x_padded = torch.nn.functional.pad(x, (1, 0), mode='replicate')
+        x_preemphasized = torch.nn.functional.conv1d(x_padded, self.flipped_filter)
 
-            if squeeze_output:
-                x_preemphasized = x_preemphasized.squeeze(1)
+        if squeeze_output:
+            x_preemphasized = x_preemphasized.squeeze(1)
 
-            return x_preemphasized
+        return x_preemphasized
 
 
 class AudioProcessor:
@@ -188,7 +210,7 @@ class AudioProcessor:
 
         num_windows = 1 + (audio_length - window_samples) // stride_samples
 
-        if (audio_length - windows_samples) % stride_samples !=0:
+        if (audio_length - window_samples) % stride_samples != 0:
             num_windows += 1
 
         windows = []
@@ -206,6 +228,51 @@ class AudioProcessor:
             windows.append(window)
         
         return torch.stack(windows)
+
+
+class ASV5MelDataset(torch.utils.data.Dataset):
+    """
+    Dataset class for ASVspoof5 Mel Spectrograms.
+    Expects mel spectrograms in .npy format with shape (128, time).
+    """
+    def __init__(self, mel_dir, protocol_file, max_len=200, normalize=True):
+        self.mel_dir = Path(mel_dir)
+        self.max_len = max_len
+        self.normalize = normalize
+        
+        print(f"Loading protocol: {protocol_file}")
+        df = pd.read_csv(protocol_file, sep=' ', header=None)
+        
+        self.file_ids = df[1].values
+        self.labels = df[8].apply(lambda x: 1 if x == 'spoof' else 0).values
+
+    def __len__(self):
+        return len(self.file_ids)
+
+    def _pad_or_truncate(self, mel):
+        time_len = mel.shape[1]
+        if time_len < self.max_len:
+            pad_len = self.max_len - time_len
+            mel = np.pad(mel, ((0, 0), (0, pad_len)), mode='constant')
+        elif time_len > self.max_len:
+            start = (time_len - self.max_len) // 2
+            mel = mel[:, start:start + self.max_len]
+        return mel
+
+    def __getitem__(self, idx):
+        file_id = self.file_ids[idx]
+        label = self.labels[idx]
+        file_path = self.mel_dir / f"{file_id}.npy"
+        try:
+            mel = np.load(file_path)
+            mel = self._pad_or_truncate(mel)
+            if self.normalize:
+                mean = mel.mean()
+                std = mel.std() + 1e-9
+                mel = (mel - mean) / std
+            return torch.from_numpy(mel).float(), torch.tensor(label).long()
+        except:
+            return torch.zeros((128, self.max_len)), torch.tensor(label).long()
 
 
 class PositionalEmbedding(nn.Module):
@@ -325,7 +392,7 @@ class ResidualBlock(nn.Module):
                 in_channels, 
                 out_channels,
                 kernel_size=1,
-                stride=stride
+                stride=1
             )
         
         self.maxpool = nn.MaxPool1d(
@@ -441,6 +508,67 @@ class AASIST3Encoder(nn.Module):
         return x
 
 
+class AASIST3_Mel(nn.Module):
+    """
+    AASIST3 Model adapted for Mel Spectrogram input.
+    """
+    def __init__(
+        self,
+        in_channels=128,
+        encoder_channels=[128, 128, 256, 256, 256, 256],
+        num_temporal_nodes=100,
+        num_spatial_nodes=100,
+        temporal_dim=64,
+        spatial_dim=64,
+        stack_dim=128,
+        num_branches=4,
+        pool_ratio=0.5,
+        temperature=1.0,
+        num_classes=2
+    ):
+        super(AASIST3_Mel, self).__init__()
+        
+        self.encoder = AASIST3Encoder(
+            in_channels=in_channels,
+            channels=encoder_channels
+        )
+        
+        encoder_out_dim = encoder_channels[-1]
+        
+        self.graph_formation = GraphFormation(
+            encoder_dim=encoder_out_dim,
+            num_temporal_nodes=num_temporal_nodes,
+            num_spatial_nodes=num_spatial_nodes,
+            temporal_dim=temporal_dim,
+            spatial_dim=spatial_dim,
+            pool_ratio=pool_ratio,
+            temperature=temperature
+        )
+        
+        self.backbone = MultiBranchArchitecture(
+            temporal_dim=temporal_dim,
+            spatial_dim=spatial_dim,
+            num_temporal_nodes=num_temporal_nodes,
+            num_spatial_nodes=num_spatial_nodes,
+            stack_dim=stack_dim,
+            num_branches=num_branches,
+            pool_ratio=pool_ratio,
+            temperature=temperature
+        )
+        
+        self.output_head = AASIST3OutputHead(
+            hidden_dim=self.backbone.hidden_dim,
+            num_classes=num_classes
+        )
+
+    def forward(self, x):
+        features = self.encoder(x)
+        h_t, h_s = self.graph_formation(features)
+        hidden = self.backbone(h_t, h_s)
+        logits = self.output_head(hidden)
+        return logits
+
+
 class KAN_GAL(nn.Module):
 
     def __init__(self, in_dim, out_dim, num_nodes, temperature=1.0, dropout=0.2):
@@ -457,31 +585,32 @@ class KAN_GAL(nn.Module):
         nn.init.xavier_uniform_(self.W_att)
         self.kan_attn_proj = KANLayer(in_dim, out_dim)
         self.kan_direct_proj = KANLayer(in_dim, out_dim)
-        self.batch_norm = nn.BatchNorm1d(num_nodes)
+        self.batch_norm = nn.BatchNorm1d(out_dim)
     
     def forward(self, h):
-        batch_size = h.size(0)
+        batch_size, num_nodes, in_dim = h.shape
         h = self.dropout(h)
         h_expanded_i = h.unsqueeze(2)
         h_expanded_j = h.unsqueeze(1)
 
         node_products = h_expanded_i * h_expanded_j
-        original_shape = node_products.shape
-        node_products_flat = node_products.view(-1, self.in_dim)
+        node_products_flat = node_products.reshape(-1, self.in_dim)
         kan_out = self.kan_attention(node_products_flat)
-        kan_out = kan_out.view(batch_size, self.num_nodes, self.num_nodes, self.in_dim)
+        kan_out = kan_out.view(batch_size, num_nodes, num_nodes, self.in_dim)
         kan_out = torch.tanh(kan_out)
+        
         attention_scores = torch.einsum('bnmd,dk->bnmk', kan_out, self.W_att)
         attention_scores = attention_scores.mean(dim=-1)
         attention_map = F.softmax(attention_scores / self.temprature, dim=-1)
+        
         h_attended = torch.bmm(attention_map, h)
-        h_attended_flat = h_attended.view(-1, self.in_dim)
+        h_attended_flat = h_attended.reshape(-1, self.in_dim)
         kan2_out = self.kan_attn_proj(h_attended_flat)
-        kan2_out = kan2_out.view(batch_size, self.num_nodes, self.out_dim)
+        kan2_out = kan2_out.view(batch_size, num_nodes, self.out_dim)
 
-        h_flat = h.view(-1, self.in_dim)
+        h_flat = h.reshape(-1, self.in_dim)
         kan3_out = self.kan_direct_proj(h_flat)
-        kan3_out = kan3_out.view(batch_size, self.num_nodes, self.out_dim)
+        kan3_out = kan3_out.view(batch_size, num_nodes, self.out_dim)
 
         output = kan2_out + kan3_out
         output = output.transpose(1,2)
@@ -498,23 +627,23 @@ class KAN_GraphPool(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.kan_score = KANLayer(in_dim, 1)
 
-    def forward(self, k=None):
+    def forward(self, h, k=None):
         batch_size, num_nodes, in_dim = h.shape
         if k is None:
             k = max(1, int(num_nodes * self.ratio))
         h_drop = self.dropout(h)
-        h_flat = h_drop.view(-1, in_dim)
+        h_flat = h_drop.reshape(-1, in_dim)
         scores_flat = self.kan_score(h_flat)
         scores = scores_flat.view(batch_size, num_nodes)
         scores = torch.sigmoid(scores)
         h_gated = h * scores.unsqueeze(-1)
-        tok_k_scores, top_k_indices = torch.topk(scores, k, dim=1)
+        top_k_scores, top_k_indices = torch.topk(scores, k, dim=1)
         top_k_indices_expanded = top_k_indices.unsqueeze(-1).expand(-1, -1, in_dim)
         h_pooled = torch.gather(h_gated, 1, top_k_indices_expanded)
         return h_pooled
 
 class KAN_HS_GAL(nn.Module):
-    def __init__(self, temporal_dim, spatial_dim, num_nodes, stack_dim, temprature=1.0, dropout=0.2):
+    def __init__(self, temporal_dim, spatial_dim, num_nodes, stack_dim, temperature=1.0, dropout=0.2):
         super(KAN_HS_GAL, self).__init__()
 
         self.temporal_dim = temporal_dim
@@ -522,7 +651,7 @@ class KAN_HS_GAL(nn.Module):
         self.num_nodes = num_nodes
         self.stack_dim = stack_dim
         self.hetero_dim = temporal_dim + spatial_dim
-        self.temprature = temprature
+        self.temperature = temperature
 
         self.dropout = nn.Dropout(dropout)
         
@@ -546,59 +675,60 @@ class KAN_HS_GAL(nn.Module):
         self.kan_hetero_update1 = KANLayer(self.hetero_dim, self.hetero_dim)
         self.kan_hetero_update2 = KANLayer(self.hetero_dim, self.hetero_dim)
         
-        self.batch_norm = nn.BatchNorm1d(num_nodes)
+        self.batch_norm = nn.BatchNorm1d(self.hetero_dim)
     
     def forward(self, h_t, h_s, S):
-
-        batch_size = h_t.size(0)
+        batch_size, num_nodes, _ = h_t.shape
         
-        h_t_proj = self.kan_temporal_proj(h_t.view(-1, self.temporal_dim))
-        h_t_proj = h_t_proj.view(batch_size, self.num_nodes, self.temporal_dim)
+        h_t_proj = self.kan_temporal_proj(h_t.reshape(-1, self.temporal_dim))
+        h_t_proj = h_t_proj.view(batch_size, num_nodes, self.temporal_dim)
         
-        h_s_proj = self.kan_spatial_proj(h_s.view(-1, self.spatial_dim))
-        h_s_proj = h_s_proj.view(batch_size, self.num_nodes, self.spatial_dim)
+        h_s_proj = self.kan_spatial_proj(h_s.reshape(-1, self.spatial_dim))
+        h_s_proj = h_s_proj.view(batch_size, num_nodes, self.spatial_dim)
         
         h_st = torch.cat([h_t_proj, h_s_proj], dim=-1)
-        
         h_st = self.dropout(h_st)
         
         h_st_i = h_st.unsqueeze(2)
         h_st_j = h_st.unsqueeze(1)
         node_products = h_st_i * h_st_j
         
-        node_products_flat = node_products.view(-1, self.hetero_dim)
+        node_products_flat = node_products.reshape(-1, self.hetero_dim)
         primary_attn_flat = self.kan_primary_attn(node_products_flat)
-        primary_attn = primary_attn_flat.view(batch_size, self.num_nodes, self.num_nodes, self.hetero_dim)
+        primary_attn = primary_attn_flat.view(batch_size, num_nodes, num_nodes, self.hetero_dim)
         A = torch.tanh(primary_attn)
         
-        B = torch.zeros(batch_size, self.num_nodes, self.num_nodes, device=h_st.device)
+        # Vectorized weight selection for Heterogeneous nodes
+        # If nodes are same, num_nodes/2 is threshold. But here h_t and h_s match.
+        # Original code used num_nodes as threshold logic.
+        idx = torch.arange(num_nodes, device=h_st.device)
+        is_temporal = idx < (num_nodes // 2)
+        is_temporal = is_temporal.unsqueeze(0).expand(num_nodes, -1) # (nodes, nodes)
         
-        for i in range(self.num_nodes):
-            for j in range(self.num_nodes):
-                if i < self.temporal_dim and j < self.temporal_dim:
-                    weight = self.W11
-                elif i >= self.temporal_dim and j >= self.temporal_dim:
-                    weight = self.W22
-                else:
-                    weight = self.W12
-                
-                B[:, i, j] = (A[:, i, j, :] * weight).sum(dim=-1)
+        W_map = torch.zeros(num_nodes, num_nodes, self.hetero_dim, device=h_st.device)
+        # Logic: 11 for (T,T), 22 for (S,S), 12 for others
+        is_TT = is_temporal & is_temporal.t()
+        is_SS = (~is_temporal) & (~is_temporal.t())
+        is_TS = ~(is_TT | is_SS)
         
+        W_map[is_TT] = self.W11
+        W_map[is_SS] = self.W22
+        W_map[is_TS] = self.W12
+        
+        B = (A * W_map.unsqueeze(0)).sum(dim=-1)
         B_hat = F.softmax(B / self.temperature, dim=-1)
         
-        S_expanded = S.unsqueeze(1).expand(-1, self.num_nodes, -1)
+        S_expanded = S.unsqueeze(1).expand(-1, num_nodes, -1)
         S_padded = F.pad(S_expanded, (0, self.hetero_dim - self.stack_dim))
         
         h_st_stack = h_st * S_padded
-        
-        h_st_stack_flat = h_st_stack.view(-1, self.hetero_dim)
+        h_st_stack_flat = h_st_stack.reshape(-1, self.hetero_dim)
         stack_attn_flat = self.kan_stack_attn(h_st_stack_flat)
-        stack_attn = stack_attn_flat.view(batch_size, self.num_nodes, self.hetero_dim)
+        stack_attn = stack_attn_flat.view(batch_size, num_nodes, self.hetero_dim)
         stack_attn = torch.tanh(stack_attn)
         
         stack_scores = torch.matmul(stack_attn, self.W_m).squeeze(-1)
         A_m = F.softmax(stack_scores / self.temperature, dim=-1)
-        
         h_st_weighted = (h_st * A_m.unsqueeze(-1)).sum(dim=1)
         
         S_update1 = self.kan_stack_update1(h_st_weighted)
@@ -607,30 +737,22 @@ class KAN_HS_GAL(nn.Module):
         
         h_st_attended = torch.bmm(B_hat, h_st)
         
-        h_st_update1_flat = h_st_attended.view(-1, self.hetero_dim)
+        h_st_update1_flat = h_st_attended.reshape(-1, self.hetero_dim)
         h_st_update1 = self.kan_hetero_update1(h_st_update1_flat)
-        h_st_update1 = h_st_update1.view(batch_size, self.num_nodes, self.hetero_dim)
+        h_st_update1 = h_st_update1.view(batch_size, num_nodes, self.hetero_dim)
         
-        h_st_update2_flat = h_st.view(-1, self.hetero_dim)
+        h_st_update2_flat = h_st.reshape(-1, self.hetero_dim)
         h_st_update2 = self.kan_hetero_update2(h_st_update2_flat)
-        h_st_update2 = h_st_update2.view(batch_size, self.num_nodes, self.hetero_dim)
+        h_st_update2 = h_st_update2.view(batch_size, num_nodes, self.hetero_dim)
         
         h_st_new = h_st_update1 + h_st_update2
-        
         h_st_new = h_st_new.transpose(1, 2)
         h_st_new = self.batch_norm(h_st_new)
         h_st_new = h_st_new.transpose(1, 2)
         
-        I_t = torch.eye(self.num_nodes, device=h_st.device)[:, :self.temporal_dim]
-        zeros_s = torch.zeros(self.num_nodes, self.spatial_dim, device=h_st.device)
-        M_t = torch.cat([I_t, zeros_s], dim=1)
-        
-        zeros_t = torch.zeros(self.num_nodes, self.temporal_dim, device=h_st.device)
-        I_s = torch.eye(self.num_nodes, device=h_st.device)[:, :self.spatial_dim]
-        M_s = torch.cat([zeros_t, I_s], dim=1)
-        
-        h_t_new = torch.matmul(h_st_new, M_t.t())
-        h_s_new = torch.matmul(h_st_new, M_s.t())
+        # Split features back (if they are the same nodes with fused features)
+        h_t_new = h_st_new[:, :, :self.temporal_dim]
+        h_s_new = h_st_new[:, :, self.temporal_dim:]
         
         return h_t_new, h_s_new, S_new
 
@@ -638,7 +760,7 @@ class KAN_HS_GAL(nn.Module):
 class GraphPositionalEmbedding(nn.Module):
     def __init__(self, num_nodes, embedding_dim):
 
-        super(PositionalEmbedding, self).__init__()
+        super(GraphPositionalEmbedding, self).__init__()
 
         self.num_nodes = num_nodes
         self.embedding_dim = embedding_dim
@@ -647,14 +769,14 @@ class GraphPositionalEmbedding(nn.Module):
         nn.init.normal_(self.pos_embedding, mean=0.0, std=0.02)
 
     def forward(self, x):
-        batch_size = x.size(0)
-        pos_emb = self.pos_embedding.expand(batch_size, -1, -1)
+        batch_size, num_nodes, _ = x.shape
+        pos_emb = self.pos_embedding[:, :num_nodes, :].expand(batch_size, -1, -1)
         return x + pos_emb
 
 
 class GraphFormation(nn.Module):
 
-    def __init__(self, encoder_dim, num_temporal_nodes = 100, , num_spatial_nodes = 100, temporal_dim = 64, spatial_dim = 64, pool_ratio = 0.5, temperature = 1.0):
+    def __init__(self, encoder_dim, num_temporal_nodes=100, num_spatial_nodes=100, temporal_dim=64, spatial_dim=64, pool_ratio=0.5, temperature=1.0):
 
         super(GraphFormation, self).__init__()
         self.encoder_dim = encoder_dim
@@ -664,8 +786,8 @@ class GraphFormation(nn.Module):
         self.spatial_dim = spatial_dim
         self.temporal_projection = nn.Linear(encoder_dim, temporal_dim)
         self.spatial_projection = nn.Linear(encoder_dim, spatial_dim)
-        self.pe_temporal = PositionalEmbedding(num_temporal_nodes, temporal_dim)
-        self.pe_spatial = PositionalEmbedding(num_spatial_nodes, spatial_dim)
+        self.pe_temporal = PositionalEmbedding(temporal_dim, num_temporal_nodes)
+        self.pe_spatial = PositionalEmbedding(spatial_dim, num_spatial_nodes)
 
         self.kan_gal_temporal = KAN_GAL(in_dim=temporal_dim, out_dim=temporal_dim, num_nodes=num_temporal_nodes, temperature=temperature)
         self.kan_gal_spatial = KAN_GAL(in_dim=spatial_dim, out_dim=spatial_dim, num_nodes=num_spatial_nodes, temperature=temperature)
@@ -686,7 +808,7 @@ class GraphFormation(nn.Module):
         batch_size, channels, time = x.shape
         x_abs = torch.abs(x)
         x_transposed = x_abs.transpose(1,2)
-        pooled = f.adaptive_max_pool1d(x_transposed.transpose(1,2), self.num_spatial_nodes)
+        pooled = F.adaptive_max_pool1d(x_transposed.transpose(1,2), self.num_spatial_nodes)
         spatial_features = pooled.transpose(1,2)
         return spatial_features
 
@@ -696,7 +818,7 @@ class GraphFormation(nn.Module):
         batch_size = encoder_output.size(0)
 
         temporal_features = self._temporal_max_pooling(encoder_output)
-        temporal_features = self._temporal_projection(temporal_features)
+        temporal_features = self.temporal_projection(temporal_features)
         temporal_features = self.pe_temporal(temporal_features)
         temporal_graph = self.kan_gal_temporal(temporal_features)
         h_t = self.kan_pool_temporal(temporal_graph, k=self.pooled_temporal_nodes)
@@ -719,7 +841,7 @@ class BranchModule(nn.Module):
         self.spatial_dim = spatial_dim
         self.pool_ratio = pool_ratio
 
-        self.hs_gal_1 = KAN_GAL(temporal_dim=temporal_dim, spatial_dim= spatial_dim, num_nodes=max(num_temporal_nodes, num_spatial_nodes), stack_dim=stack_dim, temperature=temperature)
+        self.hs_gal_1 = KAN_HS_GAL(temporal_dim=temporal_dim, spatial_dim= spatial_dim, num_nodes=max(num_temporal_nodes, num_spatial_nodes), stack_dim=stack_dim, temperature=temperature)
         self.pooled_temporal = KAN_GraphPool(temporal_dim, ratio=pool_ratio)
         self.pooled_spatial = KAN_GraphPool(spatial_dim, ratio=pool_ratio)
 
@@ -731,10 +853,10 @@ class BranchModule(nn.Module):
     def forward(self, h_t, h_s, S):
         h_t_2, h_s_2, S_2 = self.hs_gal_1(h_t, h_s, S)
 
-        h_t_pooled = self.pool_temporal(h_t_2, k=self.pooled_temporal_nodes)
-        h_s_pooled = self.pool_spatial(h_s_2, k=self.pooled_spatial_nodes)
+        h_t_pooled = self.pooled_temporal(h_t_2, k=self.pooled_temporal_nodes)
+        h_s_pooled = self.pooled_spatial(h_s_2, k=self.pooled_spatial_nodes)
 
-        h_t_3, h_s_3, S_3 = self.hs_gal_2(h_t_pooledm h_s_pooled, S_2)
+        h_t_3, h_s_3, S_3 = self.hs_gal_2(h_t_pooled, h_s_pooled, S_2)
 
         return h_t_3, h_s_3, S_3
 
@@ -778,7 +900,7 @@ class MultiBranchArchitecture(nn.Module):
         h_s_current = h_s_init
         S_current = S_init
 
-        for i, branch in enumerate(self.brnaches):
+        for i, branch in enumerate(self.branches):
             h_t_out, h_s_out, S_out = branch(h_t_current, h_s_current, S_current)
 
             temporal_outputs.append(h_t_out)
@@ -807,7 +929,7 @@ class MultiBranchArchitecture(nn.Module):
         for h_s in spatial_outputs:
             if h_s.size(1) < max_spatial_nodes:
                 pad_size = max_spatial_nodes - h_s.size(1)
-                h_s_padded = F.pad(h_s, 0, 0, 0, pad_size)
+                h_s_padded = F.pad(h_s, (0, 0, 0, pad_size))
             else:
                 h_s_padded = h_s
             spatial_padded.append(h_s_padded)
@@ -843,16 +965,18 @@ class AASIST3OutputHead(nn.Module):
 
         if use_intermediate:
             self.intermediate_kan = KANLayer(hidden_dim, intermediate_dim)
+            self.output_kan = KANLayer(intermediate_dim, num_classes)
+        else:
             self.output_kan = KANLayer(hidden_dim, num_classes)
 
-        def forward(self, hidden_features):
-            if self.use_intermediate:
-                x = self.intermediate_kan(hidden_features)
-                logits = self.output_kan(x)
-            else:
-                logits = self.output_kan(hidden_features)
+    def forward(self, hidden_features):
+        if self.use_intermediate:
+            x = self.intermediate_kan(hidden_features)
+            logits = self.output_kan(x)
+        else:
+            logits = self.output_kan(hidden_features)
 
-            return logits
+        return logits
 
 
 class AASIST3OutputWithEmbedding(nn.Module):
@@ -860,15 +984,15 @@ class AASIST3OutputWithEmbedding(nn.Module):
         super(AASIST3OutputWithEmbedding, self).__init__()
 
         self.hidden_dim = hidden_dim
-        self.embedding_dim - embedding_dim
+        self.embedding_dim = embedding_dim
         self.num_classes = num_classes
 
         self.embedding_kan = KANLayer(hidden_dim, embedding_dim)
         self.classifier_kan = KANLayer(embedding_dim, num_classes)
         self.bn_embedding = nn.BatchNorm1d(embedding_dim)
 
-    def forwad(self, hidden_features, return_embedding=False):
-        embedding = self.embedding_kanh(hidden_features)
+    def forward(self, hidden_features, return_embedding=False):
+        embedding = self.embedding_kan(hidden_features)
         embedding = self.bn_embedding(embedding)
         
         logits = self.classifier_kan(embedding)
@@ -895,10 +1019,30 @@ class AASSIT3MultiTaskOutput(nn.Module):
     def forward(self, hidden_features):
         outputs = {}
         outputs['binary'] = self.binary_head(hidden_features)
-        outputs['attack_type'] = self.attack_type_head(hidden_features)
+        outputs['attack_type'] = self.attack_head(hidden_features)
         if self.use_quality_head:
             outputs['quality'] = self.quality_head(hidden_features)
         return outputs
+
+
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=0.25, gamma=2.0, reduction='mean'):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        ce_loss = F.cross_entropy(inputs, targets, reduction='none')
+        pt = torch.exp(-ce_loss)
+        focal_loss = self.alpha * (1 - pt) ** self.gamma * ce_loss
+        
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
 
 
 class CombinedLoss(nn.Module):
@@ -965,9 +1109,9 @@ class MetricsCalculation:
         if predictions is None:
             predictions = (scores > 0.5).astype(int)
         
-        eer, eer_threshold = MetricsCalculator.compute_eer(labels, scores)
-        min_dcf = MetricsCalculator.compute_min_dcf(labels, scores)
-        accuracy = MetricsCalculator.compute_accuracy(labels, predictions)
+        eer, eer_threshold = MetricsCalculation.compute_eer(labels, scores)
+        min_dcf = MetricsCalculation.compute_min_dcf(labels, scores)
+        accuracy = MetricsCalculation.compute_accuracy(labels, predictions)
         
         tp = ((predictions == 1) & (labels == 1)).sum()
         fp = ((predictions == 1) & (labels == 0)).sum()
@@ -998,16 +1142,25 @@ class TrainAASIST3:
         device='cuda',
         scheduler=None,
         checkpoint_dir='checkpoints',
-        experiment_name='aasist3'
+        experiment_name='aasist3',
+        accumulation_steps=1,
+        use_amp=True
     ):
         self.model = model.to(device)
         self.optimizer = optimizer
         self.criterion = criterion
         self.device = device
         self.scheduler = scheduler
+        self.accumulation_steps = accumulation_steps
+        self.use_amp = use_amp
+        self.scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
+        self.scheduler = scheduler
+        self.last_val_metrics = None
+        self.gap_threshold = 20.0  # Gap % that triggers a red flag
         
         self.checkpoint_dir = os.path.join(checkpoint_dir, experiment_name)
-        os.makedirs(self.checkpoint_dir, exist_ok=True)
+        self.weights_dir = os.path.join(self.checkpoint_dir, 'weights')
+        os.makedirs(self.weights_dir, exist_ok=True)
         
         self.experiment_name = experiment_name
         
@@ -1016,6 +1169,7 @@ class TrainAASIST3:
         self.best_min_dcf = float('inf')
         self.history = {
             'train_loss': [],
+            'train_acc': [],
             'val_loss': [],
             'val_eer': [],
             'val_min_dcf': [],
@@ -1025,9 +1179,14 @@ class TrainAASIST3:
     def train_epoch(self, train_loader):
         self.model.train()
         total_loss = 0
+        total_correct = 0
+        total_samples = 0
         num_batches = 0
         
         pbar = tqdm(train_loader, desc=f'Epoch {self.current_epoch+1} [Train]')
+        
+        self.optimizer.zero_grad()
+        last_grad_norm = 0.0
         
         for batch_idx, batch in enumerate(pbar):
             if len(batch) == 2:
@@ -1037,24 +1196,64 @@ class TrainAASIST3:
             else:
                 continue
             
-            self.optimizer.zero_grad()
-            logits = self.model(audio)
+            # Use AMP with autocast
+            with torch.amp.autocast('cuda', enabled=self.use_amp):
+                logits = self.model(audio)
+                loss = self.criterion(logits, labels)
+                # Normalize loss for accumulation
+                loss = loss / self.accumulation_steps
             
-            loss = self.criterion(logits, labels)
+            # Scale loss and backward
+            self.scaler.scale(loss).backward()
             
-            loss.backward()
+            if (batch_idx + 1) % self.accumulation_steps == 0 or (batch_idx + 1) == len(train_loader):
+                # Unscale for gradient clipping and monitoring
+                self.scaler.unscale_(self.optimizer)
+                
+                # Calculate gradient norm for debugging
+                last_grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0).item()
+                
+                # Gradient Health Alerts
+                if math.isnan(last_grad_norm) or math.isinf(last_grad_norm):
+                    print(f"\n[WARNING] Gradient explosion detected at epoch {self.current_epoch+1}, batch {batch_idx+1}! Norm: {last_grad_norm}")
+                elif last_grad_norm == 0.0:
+                    print(f"\n[WARNING] Zero gradient detected at epoch {self.current_epoch+1}, batch {batch_idx+1}! Potential vanishing gradient or dead layers.")
+                
+                # Step and update scaler
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+                self.optimizer.zero_grad()
             
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            # Calculate metrics
+            with torch.no_grad():
+                preds = logits.argmax(dim=1)
+                total_correct += (preds == labels).sum().item()
+                total_samples += labels.size(0)
+                current_acc = 100 * total_correct / total_samples
             
-            self.optimizer.step()
-            
-            total_loss += loss.item()
+            total_loss += loss.item() * self.accumulation_steps
             num_batches += 1
             
-            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+            pbar_metrics = {
+                'loss': f'{loss.item()*self.accumulation_steps:.4f}',
+                'acc': f'{current_acc:.1f}%',
+                'grad': f'{last_grad_norm:.3f}'
+            }
+            if self.last_val_metrics:
+                last_val_acc = self.last_val_metrics.get('accuracy', 0)
+                gap = current_acc - last_val_acc
+                pbar_metrics['last_val'] = f"{last_val_acc:.1f}%"
+                pbar_metrics['gap'] = f"{gap:+.1f}%"
+                
+                # Overfitting Red Flag
+                if gap > self.gap_threshold:
+                    pbar.write(f"\n[RED FLAG] Overfitting detected at batch {batch_idx+1}/{len(train_loader)}! Gap: {gap:.1f}% (Train: {current_acc:.1f}%, Val: {last_val_acc:.1f}%)")
+            
+            pbar.set_postfix(pbar_metrics)
         
         avg_loss = total_loss / num_batches
-        return avg_loss
+        avg_acc = 100 * total_correct / total_samples if total_samples > 0 else 0
+        return avg_loss, avg_acc
     
     def validate(self, val_loader):
         self.model.eval()
@@ -1065,6 +1264,8 @@ class TrainAASIST3:
         all_scores = []
         all_predictions = []
         
+        num_samples = 0
+        correct_preds = 0
         pbar = tqdm(val_loader, desc=f'Epoch {self.current_epoch+1} [Val]')
         
         with torch.no_grad():
@@ -1076,9 +1277,10 @@ class TrainAASIST3:
                 else:
                     continue
                 
-                logits = self.model(audio)
+                with torch.amp.autocast('cuda', enabled=self.use_amp):
+                    logits = self.model(audio)
+                    loss = self.criterion(logits, labels)
                 
-                loss = self.criterion(logits, labels)
                 total_loss += loss.item()
                 num_batches += 1
                 
@@ -1086,15 +1288,23 @@ class TrainAASIST3:
                 spoofed_scores = probs[:, 1]  
                 predictions = logits.argmax(dim=1)
                 
+                num_samples += labels.size(0)
+                correct_preds += (predictions == labels).sum().item()
+                
                 all_labels.append(labels.cpu().numpy())
                 all_scores.append(spoofed_scores.cpu().numpy())
                 all_predictions.append(predictions.cpu().numpy())
+                
+                pbar.set_postfix({
+                    'loss': f'{total_loss/num_batches:.4f}',
+                    'acc': f'{100*correct_preds/num_samples:.1f}%'
+                })
         
         all_labels = np.concatenate(all_labels)
         all_scores = np.concatenate(all_scores)
         all_predictions = np.concatenate(all_predictions)
         
-        metrics = MetricsCalculator.compute_all_metrics(
+        metrics = MetricsCalculation.compute_all_metrics(
             all_labels, all_scores, all_predictions
         )
         
@@ -1111,22 +1321,31 @@ class TrainAASIST3:
         for epoch in range(num_epochs):
             self.current_epoch = epoch
             
-            train_loss = self.train_epoch(train_loader)
+            train_loss, train_acc = self.train_epoch(train_loader)
             
             val_metrics = self.validate(val_loader)
+            self.last_val_metrics = val_metrics
             
             self.history['train_loss'].append(train_loss)
+            self.history['train_acc'].append(train_acc)
             self.history['val_loss'].append(val_metrics['loss'])
             self.history['val_eer'].append(val_metrics['eer'])
             self.history['val_min_dcf'].append(val_metrics['min_dcf'])
             self.history['val_accuracy'].append(val_metrics['accuracy'])
             
-            print(f"\nEpoch {epoch+1}/{num_epochs}")
-            print(f"  Train Loss: {train_loss:.4f}")
-            print(f"  Val Loss:   {val_metrics['loss']:.4f}")
-            print(f"  Val EER:    {val_metrics['eer']:.2f}%")
-            print(f"  Val minDCF: {val_metrics['min_dcf']:.4f}")
-            print(f"  Val Acc:    {val_metrics['accuracy']:.2f}%")
+            # Overfitting Analysis Dashboard
+            gap = train_acc - val_metrics['accuracy']
+            print(f"\n" + "-"*40)
+            print(f" EPOCH {epoch+1}/{num_epochs} METRICS SUMMARY")
+            print(f" " + "-"*40)
+            print(f" Metric      | Training | Validation")
+            print(f" " + "-"*38)
+            print(f" Loss        | {train_loss:8.4f} | {val_metrics['loss']:10.4f}")
+            print(f" Accuracy    | {train_acc:7.2f}% | {val_metrics['accuracy']:9.2f}%")
+            print(f" Train-Val G | {gap:^8.2f}% | {'N/A':^10}")
+            print(f" EER         | {'N/A':^8} | {val_metrics['eer']:9.2f}%")
+            print(f" minDCF      | {'N/A':^8} | {val_metrics['min_dcf']:10.4f}")
+            print(f" " + "-"*40)
             
             if self.scheduler is not None:
                 if isinstance(self.scheduler, ReduceLROnPlateau):
@@ -1137,17 +1356,20 @@ class TrainAASIST3:
                 current_lr = self.optimizer.param_groups[0]['lr']
                 print(f"  Learning Rate: {current_lr:.6f}")
             
-            if val_metrics['eer'] < self.best_eer:
+            # Custom Saving Logic
+            is_best = (val_metrics['eer'] < self.best_eer)
+            self.save_checkpoint(epoch + 1, is_best=is_best)
+            self.save_epoch_log(epoch + 1, val_metrics, train_loss, train_acc)
+            
+            if is_best:
                 self.best_eer = val_metrics['eer']
                 self.best_min_dcf = val_metrics['min_dcf']
-                self.save_checkpoint('best_model.pth', val_metrics)
                 print(f"  ✓ New best model saved (EER: {self.best_eer:.2f}%)")
                 patience_counter = 0
             else:
                 patience_counter += 1
             
-            if (epoch + 1) % 5 == 0:
-                self.save_checkpoint(f'checkpoint_epoch_{epoch+1}.pth', val_metrics)
+            print(f"  ✓ Saved checkpoint and log for epoch {epoch+1}")
             
             if patience_counter >= early_stopping_patience:
                 print(f"\n⚠ Early stopping triggered after {epoch+1} epochs")
@@ -1161,10 +1383,10 @@ class TrainAASIST3:
         
         self.save_history()
     
-    def save_checkpoint(self, filename, metrics=None):
-        """Save model checkpoint."""
+    def save_checkpoint(self, epoch, is_best=False):
+        """Save model checkpoint with custom naming."""
         checkpoint = {
-            'epoch': self.current_epoch,
+            'epoch': epoch,
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'best_eer': self.best_eer,
@@ -1175,11 +1397,32 @@ class TrainAASIST3:
         if self.scheduler is not None:
             checkpoint['scheduler_state_dict'] = self.scheduler.state_dict()
         
-        if metrics is not None:
-            checkpoint['metrics'] = metrics
-        
-        filepath = os.path.join(self.checkpoint_dir, filename)
+        # Format: KANweightsEX.pth
+        filename = f"KANweightsE{epoch}.pth"
+        filepath = os.path.join(self.weights_dir, filename)
         torch.save(checkpoint, filepath)
+        
+        if is_best:
+            best_path = os.path.join(self.weights_dir, "KANweights_best.pth")
+            torch.save(checkpoint, best_path)
+
+    def save_epoch_log(self, epoch, metrics, train_loss, train_acc):
+        """Save detailed per-epoch metrics log."""
+        log_data = {
+            'epoch': epoch,
+            'timestamp': datetime.now().isoformat(),
+            'train_metrics': {
+                'loss': train_loss,
+                'accuracy': train_acc
+            },
+            'val_metrics': metrics
+        }
+        
+        # Format: EpochXLog.json
+        filename = f"Epoch{epoch}Log.json"
+        filepath = os.path.join(self.weights_dir, filename)
+        with open(filepath, 'w') as f:
+            json.dump(log_data, f, indent=4)
     
     def load_checkpoint(self, filename):
         """Load model checkpoint."""
@@ -1219,23 +1462,80 @@ def count_parameters(model):
     }
 
 
-def print_model_summary(model, input_size=(1, 64000)):
-    print("MODEL SUMMARY")
-
-    params = count_parameters(model)
-    print(f"Total parameters:     {params['total']:,}")
-    print(f"Trainable parameters: {params['trainable']:,}")
-    print(f"Frozen parameters:    {params['frozen']:,}")
+def print_training_summary(args, model, criterion, device):
+    """Print training configuration and model summary."""
+    print("\n" + "="*70)
+    print(f"{'TRAINING CONFIGURATION SUMMARY':^70}")
+    print("="*70)
     
+    params = count_parameters(model)
+    
+    summary_data = [
+        ("Experiment Name", args.experiment_name),
+        ("Device", device),
+        ("Total Epochs", args.epochs),
+        ("Batch Size", args.batch_size),
+        ("Accumulation Steps", args.accumulation_steps),
+        ("Effective Batch Size", args.batch_size * args.accumulation_steps),
+        ("Learning Rate", args.lr),
+        ("Use AMP", not args.disable_amp),
+        ("Max Length (frames)", args.max_len),
+        ("Weight Decay", 1e-4),
+        ("Patience", args.patience),
+        ("Loss Function", criterion.__class__.__name__),
+        ("Optimizer", "AdamW"),
+        ("-" * 20, "-" * 30),
+        ("Total Parameters", f"{params['total']:,}"),
+        ("Trainable Params", f"{params['trainable']:,}"),
+        ("Frozen Params", f"{params['frozen']:,}"),
+    ]
+    
+    for label, value in summary_data:
+        print(f"{label:<25}: {value}")
+    
+    print("\n" + "="*70)
+    print(f"{'MODEL ARCHITECTURE DETAILS':^70}")
+    print("="*70)
+    
+    # Extracting some model-specific details if available
+    if hasattr(model, 'encoder'):
+        print(f"Encoder Blocks    : {len(getattr(model.encoder, 'blocks', []))}")
+    
+    if hasattr(model, 'backbone'):
+        backbone = model.backbone
+        if hasattr(backbone, 'num_branches'):
+            print(f"Model Branches    : {backbone.num_branches}")
+        if hasattr(backbone, 'temporal_dim'):
+            print(f"Temporal Dim      : {backbone.temporal_dim}")
+        if hasattr(backbone, 'spatial_dim'):
+            print(f"Spatial Dim       : {backbone.spatial_dim}")
+        if hasattr(backbone, 'stack_dim'):
+            print(f"Stack Dim         : {backbone.stack_dim}")
+            
+    # Dropout details
+    dropouts = []
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Dropout):
+            dropouts.append(f"{name}: {module.p}")
+    
+    if dropouts:
+        print("\nDropout Rates:")
+        for drop in dropouts:
+            print(f"  {drop}")
+            
+    print("="*70 + "\n")
+
+def print_model_summary(model, input_size=(1, 128, 200)):
+    print("MODEL FORWARD TEST")
     model.eval()
     with torch.no_grad():
         dummy_input = torch.randn(input_size)
         try:
             output = model(dummy_input)
-            print(f"\nInput shape:  {dummy_input.shape}")
+            print(f"Input shape:  {dummy_input.shape}")
             print(f"Output shape: {output.shape}")
         except Exception as e:
-            print(f"\nForward pass failed: {e}")
+            print(f"Forward pass failed: {e}")
 
 
 def save_model_config(model, filepath):
@@ -1299,3 +1599,73 @@ class AASIST3Inference:
                 scores.append(probs[0, 1].item())
         
         return np.mean(scores)
+
+
+def run_mel_training():
+    import argparse
+    from torch.utils.data import DataLoader
+    
+    parser = argparse.ArgumentParser(description="AASIST3 Mel Training")
+    parser.add_argument("--train_mel_dir", type=str, default=r"N:\ASV5\mel_train\flac_T")
+    parser.add_argument("--train_protocol", type=str, default=r"N:\ASV5\ASVspoof5.train.tsv")
+    parser.add_argument("--dev_mel_dir", type=str, default=r"N:\ASV5\mel_dev\flac_D")
+    parser.add_argument("--dev_protocol", type=str, default=r"N:\ASV5\ASVspoof5.dev.track_1.tsv")
+    parser.add_argument("--checkpoint_dir", type=str, default=r"N:\ASV5\checkpoints")
+    parser.add_argument("--experiment_name", type=str, default="aasist3_mel_v1")
+    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--max_len", type=int, default=200)
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--patience", type=int, default=10)
+    parser.add_argument("--subset", type=int, default=None)
+    parser.add_argument("--accumulation_steps", type=int, default=1)
+    parser.add_argument("--disable_amp", action="store_true")
+
+    args = parser.parse_args()
+    
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+
+    print("Loading datasets...")
+    train_dataset = ASV5MelDataset(args.train_mel_dir, args.train_protocol, max_len=args.max_len)
+    dev_dataset = ASV5MelDataset(args.dev_mel_dir, args.dev_protocol, max_len=args.max_len)
+
+    if args.subset:
+        train_indices = torch.randperm(len(train_dataset))[:args.subset]
+        train_dataset = torch.utils.data.Subset(train_dataset, train_indices)
+        
+        # Also subset dev for faster smoke tests
+        dev_indices = torch.randperm(len(dev_dataset))[:args.subset]
+        dev_dataset = torch.utils.data.Subset(dev_dataset, dev_indices)
+        print(f"Using subset of {args.subset} training and validation samples.")
+
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True)
+    dev_loader = DataLoader(dev_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
+
+    print("Initializing AASIST3_Mel model...")
+    model = AASIST3_Mel(in_channels=128)
+    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    criterion = CombinedLoss()
+    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
+
+    # Print training summary before starting
+    print_training_summary(args, model, criterion, device)
+    print_model_summary(model, input_size=(args.batch_size, 128, args.max_len))
+
+    trainer = TrainAASIST3(
+        model=model,
+        optimizer=optimizer,
+        criterion=criterion,
+        device=device,
+        scheduler=scheduler,
+        checkpoint_dir=args.checkpoint_dir,
+        experiment_name=args.experiment_name,
+        accumulation_steps=args.accumulation_steps,
+        use_amp=not args.disable_amp
+    )
+
+    trainer.fit(train_loader, dev_loader, num_epochs=args.epochs, early_stopping_patience=args.patience)
+
+if __name__ == "__main__":
+    run_mel_training()
