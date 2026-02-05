@@ -9,8 +9,6 @@ Each component is isolated into a dedicated submodule for readability:
 ├── Feature_Extraction/  # Acoustic representations
 ├── Frontend/            # Encoder networks
 ├── Pooling/             # Frame-level aggregation
-├── Training/            # Training and evaluation tools
-└── utils/               # Shared utilities
 ```
 
 ![Python](https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white)
