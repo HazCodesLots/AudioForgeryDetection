@@ -15,7 +15,6 @@ def compute_eer(scores, labels):
 
 def compute_min_tDCF(bonafide_scores, spoof_scores):
     '''Compute minimum normalized t-DCF for ASVspoof 2019/2021'''
-    # Constant parameters for ASVspoof 2021 LA (Standard defaults)
     Pfa_asv = 0.01
     Pmiss_asv = 0.01
     C_miss = 1
@@ -45,7 +44,6 @@ def main():
     parser.add_argument('--protocol', type=str, required=True, help='Path to ASVspoof 2019 protocol file')
     args = parser.parse_args()
 
-    # 1. Load scores
     print(f"Loading scores from {args.scores}...")
     scores_dict = {}
     with open(args.scores, 'r') as f:
@@ -54,7 +52,6 @@ def main():
             if len(parts) >= 2:
                 scores_dict[parts[0]] = float(parts[1])
 
-    # 2. Load protocol and map attacks
     print(f"Loading protocol from {args.protocol}...")
     attack_metadata = {}
     all_audio_ids = []
@@ -79,7 +76,6 @@ def main():
     all_labels = np.array(all_labels)
     bonafide_scores = all_scores[all_labels == 1]
 
-    # 3. Compute Metrics
     eer, _ = compute_eer(all_scores, all_labels)
     min_tdcf = compute_min_tDCF(bonafide_scores, all_scores[all_labels == 0])
 
@@ -91,7 +87,6 @@ def main():
     print(f'Overall min t-DCF: {min_tdcf:.4f}')
     print('='*70)
 
-    # 4. Attack-wise breakdown
     print(f"\n{'ATTACK-WISE BREAKDOWN':^70}")
     print('-' * 70)
     print(f"{'Attack':<12} | {'Count':<8} | {'EER (%)':<10} | {'min t-DCF':<10}")
@@ -106,7 +101,6 @@ def main():
         atk_indices = [i for i, aid in enumerate(all_audio_ids) if attack_metadata[aid] == atk]
         atk_scores = all_scores[atk_indices]
         
-        # Merge current attack with ALL bonafide
         combined_scores = np.concatenate([bonafide_scores, atk_scores])
         combined_labels = np.concatenate([np.ones(len(bonafide_scores)), np.zeros(len(atk_scores))])
         
