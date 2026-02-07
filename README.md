@@ -1,6 +1,8 @@
 ## Overview
 A comprehensive training and evaluation framework for audio classification, speaker verification, and spoof detection with a variety of architectural configurations. The implementation is organized to enable scalable experimentation across feature types and augmentation, maintaining a clean separation between data preprocessing, model components, and training logic.  
 ## 📊 RawGAT-ST Overall EER: 2.45%, min‑tDCF: 0.1713 ASVspoof2019  
+## 📊 ResNet-18 1.41% EER LFCC 80/20 split           ODSS
+## 📊 ResNet-18 3.15% EER MFCC 80/20 split           ODSS
 ### **Detailed architectures, explanations, and training metrics are provided in the respective sub-folder READMEs.**
 
 Each component is isolated into a dedicated submodule for readability:  
