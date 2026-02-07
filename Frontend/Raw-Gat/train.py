@@ -25,12 +25,10 @@ class WeightedCrossEntropyLoss(nn.Module):
         self.weight_ratio = weight_ratio
 
     def forward(self, predictions, targets):
-        # Calculate weights
         weights = torch.ones_like(targets, dtype=torch.float)
         weights[targets == 1] = self.weight_ratio  # bonafide
         weights[targets == 0] = 1.0  # spoof
 
-        # Standard cross entropy
         loss = nn.functional.cross_entropy(predictions, targets, reduction='none')
         weighted_loss = (loss * weights).mean()
 
@@ -84,9 +82,9 @@ def train_epoch(model, train_loader, criterion, optimizer, device, epoch, accum_
     total_bonafide_acc = 0.0
     total_spoof_acc = 0.0
     batch_count = 0
-    max_grad_norm = 0.0  # Track gradient norms
+    max_grad_norm = 0.0
     
-    optimizer.zero_grad()  # Zero once at start
+    optimizer.zero_grad()
     
     pbar = tqdm(train_loader, desc=f'Epoch {epoch}')
     for batch_idx, (audio, labels, _) in enumerate(pbar):
@@ -96,10 +94,8 @@ def train_epoch(model, train_loader, criterion, optimizer, device, epoch, accum_
         outputs = model(audio)
         loss = criterion(outputs, labels)
         
-        # Scale loss by accumulation steps
         loss = loss / accum_steps
         
-        # NaN/Inf check
         if torch.isnan(loss) or torch.isinf(loss):
             print(f'\n  NaN/Inf loss detected at batch {batch_idx}, skipping')
             optimizer.zero_grad()
@@ -107,12 +103,9 @@ def train_epoch(model, train_loader, criterion, optimizer, device, epoch, accum_
         
         loss.backward()
         
-        # Update weights every accum_steps
         if (batch_idx + 1) % accum_steps == 0:
-            # Compute gradient norm before clipping for monitoring
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
             
-            # Check for gradient explosion
             if torch.isnan(grad_norm) or torch.isinf(grad_norm):
                 print(f'\n  Gradient explosion at batch {batch_idx}! Skipping update.')
                 optimizer.zero_grad()
@@ -123,18 +116,16 @@ def train_epoch(model, train_loader, criterion, optimizer, device, epoch, accum_
             optimizer.step()
             optimizer.zero_grad()
         
-        running_loss += loss.item() * accum_steps  # Unscale for logging
+        running_loss += loss.item() * accum_steps
         _, predicted = outputs.max(1)
         total += labels.size(0)
         correct += predicted.eq(labels).sum().item()
         
-        # Compute class-wise accuracies
         bonafide_acc, spoof_acc = compute_class_accuracies(outputs, labels)
         total_bonafide_acc += bonafide_acc
         total_spoof_acc += spoof_acc
         batch_count += 1
         
-        # Update progress bar with gradient norm info
         pbar.set_postfix({
             'loss': f'{running_loss/(batch_idx+1):.4f}',
             'acc': f'{100.*correct/total:.2f}%',
@@ -143,7 +134,6 @@ def train_epoch(model, train_loader, criterion, optimizer, device, epoch, accum_
             'gnorm': f'{max_grad_norm:.2f}'
         })
     
-    # Final update for remaining batches
     if (batch_idx + 1) % accum_steps != 0:
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
@@ -181,8 +171,6 @@ def validate(model, val_loader, criterion, device):
             total += labels.size(0)
             correct += predicted.eq(labels).sum().item()
 
-            # Get scores for bonafide class
-            # Logit-difference for EER (Standard RawGAT-ST/ASVspoof)
             scores = outputs[:, 1] - outputs[:, 0]
             val_scores.extend(scores.cpu().numpy())
             val_labels.extend(labels.cpu().numpy())
@@ -191,15 +179,12 @@ def validate(model, val_loader, criterion, device):
     val_loss = running_loss / len(val_loader)
     val_acc = 100. * correct / total
 
-    # Convert to numpy
     all_scores = np.array(all_scores)
     all_labels = np.array(all_labels)
     all_predictions = np.array(all_predictions)
 
-    # Compute EER
     eer = compute_eer(all_scores, all_labels)
 
-    # Compute class-wise accuracies
     bonafide_mask = all_labels == 1
     spoof_mask = all_labels == 0
 
@@ -210,18 +195,15 @@ def validate(model, val_loader, criterion, device):
 
 
 def train(args):
-    # Set device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Using device: {device}')
 
-    # Create model
     model = RawGAT_ST(num_classes=2).to(device)
     print(f'Model parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M')
 
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     start_epoch = 1
 
-    # Resume from checkpoint if provided
     if args.resume and os.path.exists(args.resume):
         print(f'Resuming from checkpoint: {args.resume}')
         checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
@@ -231,7 +213,6 @@ def train(args):
         start_epoch = checkpoint.get('epoch', 0) + 1
         print(f'Resuming from epoch {start_epoch}')
 
-    # Create data loaders
     print('\nLoading training data...')
     train_loader = get_dataloader(
         data_dir=args.train_data,
@@ -252,17 +233,11 @@ def train(args):
         is_eval=False
     )
 
-    # Loss and optimizer
-    # Add label smoothing to prevent overconfidence
     criterion = WeightedCrossEntropyLoss(weight_ratio=9.0)
     
-    # Track gradient norms
     total_grad_norms = []
 
-    # Tensorboard
-    #writer = SummaryWriter(log_dir=args.log_dir)
 
-    # JSON logging
     metrics_log = {
         'config': {
             'batch_size': args.batch_size,
@@ -275,7 +250,6 @@ def train(args):
         'epochs': []
     }
 
-    # Training loop
     best_eer = float('inf')
     best_loss = float('inf')
 
@@ -301,7 +275,6 @@ def train(args):
         print(f'Spoof Acc: {val_spoof_acc:.2f}%')
         print(f'EER: {eer:.2f}%')
 
-        # Store metrics in JSON
         epoch_metrics = {
             'epoch': epoch,
             'train': {
@@ -320,23 +293,11 @@ def train(args):
         }
         metrics_log['epochs'].append(epoch_metrics)
 
-        # Save JSON after every epoch
         json_path = os.path.join(args.save_dir, 'training_metrics.json')
         with open(json_path, 'w') as f:
             json.dump(metrics_log, f, indent=2)
 
-        # Tensorboard logging
-        #writer.add_scalar('Loss/train', train_loss, epoch)
-        #writer.add_scalar('Loss/val', val_loss, epoch)
-        #writer.add_scalar('Accuracy/train', train_acc, epoch)
-        #writer.add_scalar('Accuracy/val', val_acc, epoch)
-        #writer.add_scalar('Accuracy/train_bonafide', train_bonafide_acc, epoch)
-        #writer.add_scalar('Accuracy/train_spoof', train_spoof_acc, epoch)
-        #writer.add_scalar('Accuracy/val_bonafide', val_bonafide_acc, epoch)
-        #writer.add_scalar('Accuracy/val_spoof', val_spoof_acc, epoch)
-        #writer.add_scalar('EER/val', eer, epoch)
 
-        # Save best model based on validation loss
         if val_loss < best_loss:
             best_loss = val_loss
             best_eer = eer
@@ -351,7 +312,6 @@ def train(args):
             }, os.path.join(args.save_dir, 'best_model.pth'))
             print(f'\n Saved best model (loss: {val_loss:.4f}, EER: {eer:.2f}%)')
 
-        # Save checkpoint every N epochs
         if epoch % args.save_interval == 0:
             torch.save({
                 'epoch': epoch,
@@ -364,7 +324,6 @@ def train(args):
             }, os.path.join(args.save_dir, f'checkpoint_epoch{epoch}.pth'))
             print(f' Saved checkpoint at epoch {epoch}')
 
-    # Final save
     metrics_log['config']['end_time'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     metrics_log['config']['best_loss'] = float(best_loss)
     metrics_log['config']['best_eer'] = float(best_eer)
@@ -372,21 +331,16 @@ def train(args):
     with open(json_path, 'w') as f:
         json.dump(metrics_log, f, indent=2)
 
-    #writer.close()
 
-    print(f'\n{"="*70}')
     print(f' TRAINING COMPLETED!')
-    print(f'{"="*70}')
     print(f'Best validation loss: {best_loss:.4f}')
     print(f'Best EER: {best_eer:.2f}%')
     print(f'Metrics saved to: {json_path}')
-    print(f'{"="*70}')
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Train RawGAT-ST model')
 
-    # Data paths
     parser.add_argument('--train_data', type=str, 
                        default=r'N:\ASVspoof2019\LA\ASVspoof2019_LA_train\flac',
                        help='Path to training audio files')
@@ -400,13 +354,11 @@ if __name__ == '__main__':
                        default=r'N:\ASVspoof2019\LA\ASVspoof2019_LA_cm_protocols\ASVspoof2019.LA.cm.dev.trl.txt',
                        help='Path to development protocol file')
 
-    # Training parameters
     parser.add_argument('--batch_size', type=int, default=10, help='Batch size')
     parser.add_argument('--epochs', type=int, default=300, help='Number of epochs')
     parser.add_argument('--lr', type=float, default=0.0001, help='Learning rate')
     parser.add_argument('--num_workers', type=int, default=4, help='Number of data loading workers')
 
-    # Saving
     parser.add_argument('--save_dir', type=str, default='./checkpoints_aug', help='Directory to save models')
     parser.add_argument('--log_dir', type=str, default='./logs_aug', help='Directory for tensorboard logs')
     parser.add_argument('--save_interval', type=int, default=1, help='Save checkpoint every N epochs')
@@ -414,9 +366,8 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
-    # Create directories
+
     os.makedirs(args.save_dir, exist_ok=True)
     os.makedirs(args.log_dir, exist_ok=True)
 
-    # Train
     train(args)
