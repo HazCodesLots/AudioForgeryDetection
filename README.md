@@ -10,6 +10,7 @@ Each component is isolated into a dedicated submodule for readability:
 ├── Frontend/            # Encoder networks
 ├── Pooling/             # Frame-level aggregation
 ```
+## 📊 RawGAT-ST Overall EER: 2.45%, min‑tDCF: 0.1713 ASVspoof2019  
 
 ![Python](https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white)
 ![PyTorch](https://img.shields.io/badge/PyTorch-EE4C2C?style=for-the-badge&logo=pytorch&logoColor=white)
