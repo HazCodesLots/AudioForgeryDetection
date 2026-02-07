@@ -157,23 +157,6 @@ class TemporalAttention(nn.Module):
         
         return x * att.expand_as(x)
 
-class SpectralAttention(nn.Module):
-    def __init__(self, in_channels):
-        super().__init__()
-        self.conv_squeeze = nn.Sequential(
-            nn.Conv2d(in_channels, in_channels // 4, kernel_size=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(in_channels // 4, in_channels, kernel_size=1),
-            nn.Sigmoid()
-        )
-    
-    def forward(self, x):
-        # x: [B, C, T, F]
-        # Average pool across time dimension
-        freq_att = x.mean(dim=2, keepdim=True)  # [B, C, 1, F]
-        freq_att = self.conv_squeeze(freq_att)  # [B, C, 1, F]
-        return x * freq_att  # [B, C, T, F] * [B, C, 1, F]
-
 
 class ResNetSE(nn.Module):
     def __init__(self, block, layers, num_classes=2, in_channels=1, reduction=16, base_channels=64):
@@ -186,7 +169,6 @@ class ResNetSE(nn.Module):
         
         # NEW: Add temporal attention after conv1
         self.temporal_attn = TemporalAttention(base_channels, reduction=4)
-        self.spectral_attn = SpectralAttention(base_channels)
         
         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
         self.layer1 = self._make_layer(block, base_channels, layers[0])
@@ -212,8 +194,8 @@ class ResNetSE(nn.Module):
         x = self.bn1(x)
         x = self.relu(x)
         
+        # NEW: Apply temporal attention
         x = self.temporal_attn(x)
-        x = self.spectral_attn(x)
         
         x = self.maxpool(x)
         x = self.layer1(x)
@@ -303,7 +285,7 @@ class ASVspoof2019Eval(Dataset):
             return torch.zeros(4, self.max_len, self.n_ceps), torch.tensor(sample['label']), sample['attack_type'], sample['audio_id']
 
 def compute_eer(y_true, y_score):
-    fpr, tpr, thresholds = roc_curve(y_true, y_score, pos_label=0)
+    fpr, tpr, thresholds = roc_curve(y_true, y_score, pos_label=1)
     fnr = 1 - tpr
     eer_idx = np.nanargmin(np.absolute(fnr - fpr))
     return fpr[eer_idx] * 100
@@ -329,7 +311,7 @@ def evaluate_epoch(epoch_path, model, device, eval_loader):
         for inputs, labels, attack_types, audio_ids in tqdm(eval_loader, desc=f"Eval {epoch_path}"):
             inputs = inputs.to(device)
             outputs = model(inputs)
-            probs = torch.softmax(outputs, dim=1)[:, 0].cpu().numpy()
+            probs = torch.softmax(outputs, dim=1)[:, 1].cpu().numpy()
             for i in range(len(probs)):
                 results.append({'audio_id': audio_ids[i], 'attack_type': attack_types[i], 'label': labels[i].item(), 'score': probs[i]})
     
@@ -349,7 +331,7 @@ def run_evaluation():
 
     model = resnet18_se(num_classes=2, in_channels=CHANNELS).to(device)
     eval_dataset = ASVspoof2019Eval(EVAL_AUDIO_DIR, EVAL_PROTOCOL, max_len=MAX_LEN, n_ceps=N_CEPS)
-    eval_loader = DataLoader(eval_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+    eval_loader = DataLoader(eval_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
 
     # Load ASV Metrics for Eval set
     ASV_SCORES_FILE = DATA_ROOT / "ASVspoof2019_LA_asv_scores" / "ASVspoof2019.LA.asv.eval.gi.trl.scores.txt"
@@ -369,7 +351,7 @@ def run_evaluation():
 
         global_eer = compute_eer(df['label'], df['score'])
         min_tdcf = compute_min_tDCF(df['score'].values, df['audio_id'].values, asv_metrics)
-        print(f"GLOBAL EVAL EER ({epoch_file}): {global_eer:.4f}% | t-minDCF: {min_tdcf:.4f}")
+        print(f"GLOBAL EVAL EER ({epoch_file}): {global_eer:.4f}% | min_tDCF: {min_tdcf:.4f}")
 
         attack_groups = df.groupby('attack_type')
         bonafide_scores = df[df['label'] == 1]['score'].values
@@ -390,24 +372,6 @@ def run_evaluation():
             "Attack_EERs": attack_eers
         }
         print("-" * 40)
-    
-    # Best-by-eval-minDCF and best A17
-    if final_results:
-        best_tdcf_epoch = min(final_results.items(), key=lambda x: x[1]["min_tDCF"])
-        best_a17 = None
-        for path, data in final_results.items():
-            ae = data.get("Attack_EERs", {})
-            if "A17" in ae:
-                if best_a17 is None or ae["A17"] < best_a17[1]:
-                    best_a17 = (path, ae["A17"])
-        print("\n" + "=" * 60)
-        print("EVAL SUMMARY")
-        print("=" * 60)
-        print(f"Best eval t-minDCF: {best_tdcf_epoch[1]['min_tDCF']:.4f} @ {best_tdcf_epoch[0]}")
-        print(f"  -> Use this checkpoint for best tandem performance.")
-        if best_a17 is not None:
-            print(f"Best A17 EER:       {best_a17[1]:.4f}% @ {best_a17[0]}")
-        print("=" * 60)
         
     # Save to JSON
     with open("eval_results_all_epochs.json", "w") as f:

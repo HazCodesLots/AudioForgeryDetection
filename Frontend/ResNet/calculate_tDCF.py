@@ -44,14 +44,16 @@ def compute_eer(target_scores, nontarget_scores):
     return eer, threshold
 
 def compute_tDCF_legacy(bonafide_score_cm, spoof_score_cm, Pfa_asv, Pmiss_asv, Pmiss_spoof_asv, cost_model, print_cost=False):
-    C1 = cost_model['Ptar'] * cost_model['Cmiss'] - \
-         cost_model['Ptar'] * cost_model['Cmiss'] * Pmiss_asv - \
+    # Official constants from ASVspoof 2019 evaluation plan
+    C0 = cost_model['Ptar'] * cost_model['Cmiss'] * Pmiss_asv + \
          cost_model['Pnon'] * cost_model['Cfa'] * Pfa_asv
-    C2 = cost_model['Pspoof'] * cost_model['Cfa_spoof'] * Pmiss_spoof_asv
-
-    t_DCF_default = min(C1, C2)
-    if t_DCF_default <= 0:
-        return 1.0
+         
+    C1 = cost_model['Ptar'] * cost_model['Cmiss'] * (1 - Pmiss_asv)
+         
+    C2 = cost_model['Pspoof'] * cost_model['Cfa_spoof'] * (1 - Pmiss_spoof_asv)
+    
+    if C0 == 0: 
+        return 0.0
 
     scores = np.concatenate((bonafide_score_cm, spoof_score_cm))
     labels = np.concatenate((np.ones(len(bonafide_score_cm)), np.zeros(len(spoof_score_cm))))
@@ -72,11 +74,11 @@ def compute_tDCF_legacy(bonafide_score_cm, spoof_score_cm, Pfa_asv, Pmiss_asv, P
 def compute_min_tDCF(cm_scores, audio_ids, asv_data, cost_model=None):
     if cost_model is None:
         cost_model = {
-            'Ptar': 0.9405,
-            'Pnon': 0.0095,
+            'Ptar': 0.05,
+            'Pnon': 0.90, # Official value
             'Pspoof': 0.05,
             'Cmiss': 1,
-            'Cfa': 10,
+            'Cfa': 10, 
             'Cfa_spoof': 10
         }
     
