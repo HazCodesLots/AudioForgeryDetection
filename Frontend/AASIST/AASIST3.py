@@ -65,24 +65,16 @@ class KANLayer(nn.Module):
         Vectorized computation of B-spline bases using De Boor's recursion.
         Significantly faster than nested loops.
         """
-        # x: [..., in_features]
-        # grid: [num_grid_points]
-        x = x.unsqueeze(-1) # [..., in_features, 1]
+
+        x = x.unsqueeze(-1)
         grid = self.grid
         
-        # Initial bases (k=0)
-        # bases: [..., in_features, num_grid_points - 1]
         bases = ((x >= grid[:-1]) & (x < grid[1:])).float()
         
-        # Recursive calculation (k=1 to spline_order)
         for k in range(1, self.spline_order + 1):
-            # Left term
-            # grid[:-k-1] is t_i, grid[k:-1] is t_{i+k}
             left_den = grid[k:-1] - grid[:-k-1]
             left_term = ((x - grid[:-k-1]) / left_den) * bases[..., :-1]
             
-            # Right term
-            # grid[1:-k] is t_{i+1}, grid[k+1:] is t_{i+k+1}
             right_den = grid[k+1:] - grid[1:-k]
             right_term = ((grid[k+1:] - x) / right_den) * bases[..., 1:]
             
@@ -91,54 +83,24 @@ class KANLayer(nn.Module):
         return bases.contiguous()
 
     def _prelu(self, x: torch.Tensor):
-        # x: [..., in_features]
-        # self.prelu_weight: [out_features, in_features]
-        # output: [out_features, ..., in_features]
-        
-        # Simplified and vectorized PReLU
-        # We want to apply different weight per (in_feature, out_feature) pair
-        # Formula: pos(x) + weight * neg(x)
         
         pos = F.relu(x)
         neg = x - pos
         
-        # We use einsum to handle the broadcasting efficiently
-        # i: out_features, j: in_features, ...: batch/time dims
-        # weight(ij), x(...j) -> output(i...j)
         return torch.einsum('ij,...j->i...j', self.prelu_weight, neg) + pos.unsqueeze(0)
 
     def forward(self, x: torch.Tensor):
-        # x: [..., in_features]
         batch_shape = x.shape[:-1]
         x_clamped = torch.clamp(x, self.grid_range[0], self.grid_range[1])
 
-        # 1. Base path (PReLU)
-        # base_output: [out_features, ..., in_features]
         base_output = self._prelu(x_clamped)
 
-        # 2. Spline path
-        # bspline_basis: [..., in_features, num_coeffs]
         bspline_basis = self._compute_bspline_basis(x_clamped)
-
-        # spline_coeffs: [out_features, in_features, num_coeffs]
-        # We want to multiply each (in_feature, num_coeff) with its corresponding weight
-        # and sum over num_coeffs.
-        # i: out_features, j: in_features, k: num_coeffs, ...: batch dims
-        # spline_coeffs(ijk), bspline_basis(...jk) -> spline_output(i...j)
         spline_output = torch.einsum('ijk,...jk->i...j', self.spline_coeffs, bspline_basis)
-
-        # 3. Final weighted sum
-        # output = base_w * base_output + spline_w * spline_output
-        # then sum over in_features (j)
-        # base_w: [out_features, in_features]
-        # spline_w: [out_features, in_features]
         
-        # Final output(i...) = sum_j (base_w(ij)*base_output(i...j) + spline_w(ij)*spline_output(i...j))
         output = torch.einsum('ij,i...j->i...', self.base_weight, base_output) + \
                  torch.einsum('ij,i...j->i...', self.spline_weight, spline_output)
 
-        # Transpose back: [out_features, ...] -> [..., out_features]
-        # move dim 0 to the end
         dims = list(range(1, output.dim())) + [0]
         return output.permute(*dims).contiguous()
 
@@ -698,15 +660,11 @@ class KAN_HS_GAL(nn.Module):
         primary_attn = primary_attn_flat.view(batch_size, num_nodes, num_nodes, self.hetero_dim)
         A = torch.tanh(primary_attn)
         
-        # Vectorized weight selection for Heterogeneous nodes
-        # If nodes are same, num_nodes/2 is threshold. But here h_t and h_s match.
-        # Original code used num_nodes as threshold logic.
         idx = torch.arange(num_nodes, device=h_st.device)
         is_temporal = idx < (num_nodes // 2)
-        is_temporal = is_temporal.unsqueeze(0).expand(num_nodes, -1) # (nodes, nodes)
+        is_temporal = is_temporal.unsqueeze(0).expand(num_nodes, -1)
         
         W_map = torch.zeros(num_nodes, num_nodes, self.hetero_dim, device=h_st.device)
-        # Logic: 11 for (T,T), 22 for (S,S), 12 for others
         is_TT = is_temporal & is_temporal.t()
         is_SS = (~is_temporal) & (~is_temporal.t())
         is_TS = ~(is_TT | is_SS)
@@ -750,7 +708,6 @@ class KAN_HS_GAL(nn.Module):
         h_st_new = self.batch_norm(h_st_new)
         h_st_new = h_st_new.transpose(1, 2)
         
-        # Split features back (if they are the same nodes with fused features)
         h_t_new = h_st_new[:, :, :self.temporal_dim]
         h_s_new = h_st_new[:, :, self.temporal_dim:]
         
@@ -1165,8 +1122,8 @@ class TrainAASIST3:
         self.scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
         self.scheduler = scheduler
         self.last_val_metrics = None
-        self.gap_threshold = 20.0  # Gap % that triggers a red flag
-        self.skipped_steps = 0     # Counter for skipped steps due to inf/nan
+        self.gap_threshold = 20.0
+        self.skipped_steps = 0
         
         self.checkpoint_dir = os.path.join(checkpoint_dir, experiment_name)
         self.weights_dir = os.path.join(self.checkpoint_dir, 'weights')
@@ -1215,42 +1172,33 @@ class TrainAASIST3:
             else:
                 continue
             
-            # Use AMP with autocast
             with torch.amp.autocast('cuda', enabled=self.use_amp):
                 logits = self.model(audio)
                 loss = self.criterion(logits, labels)
-                # Normalize loss for accumulation
                 loss = loss / self.accumulation_steps
             
-            # Scale loss and backward
             self.scaler.scale(loss).backward()
             
             if (batch_idx + 1) % self.accumulation_steps == 0 or (batch_idx + 1) == len(train_loader):
-                # Unscale for gradient clipping and monitoring
                 self.scaler.unscale_(self.optimizer)
                 
-                # Calculate gradient norm for debugging
                 last_grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5).item()
                 epoch_grad_norms.append(last_grad_norm)
                 
-                # Gradient Health Alerts
                 if math.isnan(last_grad_norm) or math.isinf(last_grad_norm):
                     print(f"\n[WARNING] Gradient explosion detected at epoch {self.current_epoch+1}, batch {batch_idx+1}! Norm: {last_grad_norm}")
                 elif last_grad_norm == 0.0:
                     print(f"\n[WARNING] Zero gradient detected at epoch {self.current_epoch+1}, batch {batch_idx+1}! Potential vanishing gradient or dead layers.")
                 
-                # Step and update scaler
                 old_scale = self.scaler.get_scale()
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 
-                # Check if step was skipped
                 if self.scaler.get_scale() < old_scale:
                     self.skipped_steps += 1
                 
                 self.optimizer.zero_grad()
             
-            # Calculate metrics
             with torch.no_grad():
                 preds = logits.argmax(dim=1)
                 total_samples += labels.size(0)
@@ -1280,7 +1228,6 @@ class TrainAASIST3:
                 pbar_metrics['last_val'] = f"{last_val_acc:.1f}%"
                 pbar_metrics['gap'] = f"{gap:+.1f}%"
                 
-                # Overfitting Red Flag
                 if gap > self.gap_threshold:
                     red_flag_count += 1
                     max_gap_observed = max(max_gap_observed, gap)
@@ -1414,11 +1361,9 @@ class TrainAASIST3:
                 current_lr = self.optimizer.param_groups[0]['lr']
                 print(f"  Learning Rate: {current_lr:.6f}")
             
-            # Custom Saving Logic
             is_best = (val_metrics['eer'] < self.best_eer)
             self.save_checkpoint(epoch + 1, is_best=is_best)
             
-            # Prepare extended training info for log
             train_info = {
                 'loss': train_loss,
                 'accuracy': train_acc,
@@ -1466,19 +1411,16 @@ class TrainAASIST3:
         if self.scheduler is not None:
             checkpoint['scheduler_state_dict'] = self.scheduler.state_dict()
         
-        # Format: KANweightsE[X].pth (original)
         filename = f"KANweightsE{epoch}.pth"
         filepath = os.path.join(self.weights_dir, filename)
         torch.save(checkpoint, filepath)
         
-        # New Standardized Naming: AASIST3_Epoch[X].pth in root
         root_filename = f"AASIST3_Epoch{epoch}.pth"
         torch.save(checkpoint, root_filename)
         
         if is_best:
             best_path = os.path.join(self.weights_dir, "KANweights_best.pth")
             torch.save(checkpoint, best_path)
-            # Also save best in root
             torch.save(checkpoint, "aasist3_best.pth")
 
     def save_epoch_log(self, epoch, val_metrics, train_info):
@@ -1580,7 +1522,6 @@ def print_training_summary(args, model, criterion, device):
     print(f"{'MODEL ARCHITECTURE DETAILS':^70}")
     print("="*70)
     
-    # Extracting some model-specific details if available
     if hasattr(model, 'encoder'):
         print(f"Encoder Blocks    : {len(getattr(model.encoder, 'blocks', []))}")
     
@@ -1595,7 +1536,6 @@ def print_training_summary(args, model, criterion, device):
         if hasattr(backbone, 'stack_dim'):
             print(f"Stack Dim         : {backbone.stack_dim}")
             
-    # Dropout details
     dropouts = []
     for name, module in model.named_modules():
         if isinstance(module, nn.Dropout):
@@ -1718,7 +1658,6 @@ def run_mel_training():
         train_indices = torch.randperm(len(train_dataset))[:args.subset]
         train_dataset = torch.utils.data.Subset(train_dataset, train_indices)
         
-        # Also subset dev for faster smoke tests
         dev_indices = torch.randperm(len(dev_dataset))[:args.subset]
         dev_dataset = torch.utils.data.Subset(dev_dataset, dev_indices)
         print(f"Using subset of {args.subset} training and validation samples.")
