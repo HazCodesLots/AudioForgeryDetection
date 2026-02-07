@@ -1,0 +1,79 @@
+{
+    "dataset": "ASVspoof 2019 LA Evaluation",
+    "model_checkpoint": "checkpoint_epoch27.pth",
+    "overall_metrics": {
+        "EER_percent": 2.45,
+        "min_tDCF_normalized": 0.1713,
+        "total_samples": 71237,
+        "bonafide": 7355,
+        "spoof": 63882
+    },
+    "attack_wise_breakdown": {
+        "A07": {
+            "EER_percent": 0.87,
+            "min_tDCF": 0.0258,
+            "count": 4914
+        },
+        "A08": {
+            "EER_percent": 0.24,
+            "min_tDCF": 0.0094,
+            "count": 4914
+        },
+        "A09": {
+            "EER_percent": 0.03,
+            "min_tDCF": 0.0005,
+            "count": 4914
+        },
+        "A10": {
+            "EER_percent": 1.44,
+            "min_tDCF": 0.0674,
+            "count": 4914
+        },
+        "A11": {
+            "EER_percent": 0.45,
+            "min_tDCF": 0.0189,
+            "count": 4914
+        },
+        "A12": {
+            "EER_percent": 1.21,
+            "min_tDCF": 0.0311,
+            "count": 4914
+        },
+        "A13": {
+            "EER_percent": 0.57,
+            "min_tDCF": 0.0158,
+            "count": 4914
+        },
+        "A14": {
+            "EER_percent": 0.22,
+            "min_tDCF": 0.0046,
+            "count": 4914
+        },
+        "A15": {
+            "EER_percent": 0.61,
+            "min_tDCF": 0.0261,
+            "count": 4914
+        },
+        "A16": {
+            "EER_percent": 1.38,
+            "min_tDCF": 0.0917,
+            "count": 4914
+        },
+        "A17": {
+            "EER_percent": 5.93,
+            "min_tDCF": 0.3949,
+            "count": 4914
+        },
+        "A18": {
+            "EER_percent": 7.45,
+            "min_tDCF": 0.4987,
+            "count": 4914
+        },
+        "A19": {
+            "EER_percent": 1.21,
+            "min_tDCF": 0.0501,
+            "count": 4914
+        }
+    },
+    "timestamp": "2026-02-07 21:45:00"
+}

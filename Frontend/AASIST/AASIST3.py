@@ -1113,6 +1113,13 @@ class MetricsCalculation:
         min_dcf = MetricsCalculation.compute_min_dcf(labels, scores)
         accuracy = MetricsCalculation.compute_accuracy(labels, predictions)
         
+        # Class-specific accuracies
+        bonafide_mask = (labels == 1)
+        spoof_mask = (labels == 0)
+        
+        bonafide_acc = 100 * (predictions[bonafide_mask] == labels[bonafide_mask]).sum() / (bonafide_mask.sum() + 1e-8)
+        spoof_acc = 100 * (predictions[spoof_mask] == labels[spoof_mask]).sum() / (spoof_mask.sum() + 1e-8)
+        
         tp = ((predictions == 1) & (labels == 1)).sum()
         fp = ((predictions == 1) & (labels == 0)).sum()
         fn = ((predictions == 0) & (labels == 1)).sum()
@@ -1126,6 +1133,8 @@ class MetricsCalculation:
             'eer_threshold': eer_threshold,
             'min_dcf': min_dcf,
             'accuracy': accuracy,
+            'bonafide_acc': bonafide_acc,
+            'spoof_acc': spoof_acc,
             'precision': precision,
             'recall': recall,
             'f1': f1
@@ -1157,6 +1166,7 @@ class TrainAASIST3:
         self.scheduler = scheduler
         self.last_val_metrics = None
         self.gap_threshold = 20.0  # Gap % that triggers a red flag
+        self.skipped_steps = 0     # Counter for skipped steps due to inf/nan
         
         self.checkpoint_dir = os.path.join(checkpoint_dir, experiment_name)
         self.weights_dir = os.path.join(self.checkpoint_dir, 'weights')
@@ -1181,7 +1191,16 @@ class TrainAASIST3:
         total_loss = 0
         total_correct = 0
         total_samples = 0
+        total_bonafide_correct = 0
+        total_bonafide = 0
+        total_spoof_correct = 0
+        total_spoof = 0
         num_batches = 0
+        epoch_grad_norms = []
+        
+        red_flag_triggered = False
+        red_flag_count = 0
+        max_gap_observed = 0.0
         
         pbar = tqdm(train_loader, desc=f'Epoch {self.current_epoch+1} [Train]')
         
@@ -1211,7 +1230,8 @@ class TrainAASIST3:
                 self.scaler.unscale_(self.optimizer)
                 
                 # Calculate gradient norm for debugging
-                last_grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0).item()
+                last_grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5).item()
+                epoch_grad_norms.append(last_grad_norm)
                 
                 # Gradient Health Alerts
                 if math.isnan(last_grad_norm) or math.isinf(last_grad_norm):
@@ -1220,15 +1240,29 @@ class TrainAASIST3:
                     print(f"\n[WARNING] Zero gradient detected at epoch {self.current_epoch+1}, batch {batch_idx+1}! Potential vanishing gradient or dead layers.")
                 
                 # Step and update scaler
+                old_scale = self.scaler.get_scale()
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
+                
+                # Check if step was skipped
+                if self.scaler.get_scale() < old_scale:
+                    self.skipped_steps += 1
+                
                 self.optimizer.zero_grad()
             
             # Calculate metrics
             with torch.no_grad():
                 preds = logits.argmax(dim=1)
-                total_correct += (preds == labels).sum().item()
                 total_samples += labels.size(0)
+                
+                bonafide_mask = (labels == 1)
+                spoof_mask = (labels == 0)
+                total_bonafide_correct += (preds[bonafide_mask] == labels[bonafide_mask]).sum().item()
+                total_bonafide += bonafide_mask.sum().item()
+                total_spoof_correct += (preds[spoof_mask] == labels[spoof_mask]).sum().item()
+                total_spoof += spoof_mask.sum().item()
+                
+                total_correct = total_bonafide_correct + total_spoof_correct
                 current_acc = 100 * total_correct / total_samples
             
             total_loss += loss.item() * self.accumulation_steps
@@ -1237,7 +1271,8 @@ class TrainAASIST3:
             pbar_metrics = {
                 'loss': f'{loss.item()*self.accumulation_steps:.4f}',
                 'acc': f'{current_acc:.1f}%',
-                'grad': f'{last_grad_norm:.3f}'
+                'grad': f'{last_grad_norm:.3f}',
+                'skip': self.skipped_steps
             }
             if self.last_val_metrics:
                 last_val_acc = self.last_val_metrics.get('accuracy', 0)
@@ -1247,13 +1282,32 @@ class TrainAASIST3:
                 
                 # Overfitting Red Flag
                 if gap > self.gap_threshold:
-                    pbar.write(f"\n[RED FLAG] Overfitting detected at batch {batch_idx+1}/{len(train_loader)}! Gap: {gap:.1f}% (Train: {current_acc:.1f}%, Val: {last_val_acc:.1f}%)")
+                    red_flag_count += 1
+                    max_gap_observed = max(max_gap_observed, gap)
+                    if not red_flag_triggered:
+                        pbar.write(f"\n[RED FLAG] Overfitting detected at batch {batch_idx+1}/{len(train_loader)}! Gap: {gap:.1f}% (Train: {current_acc:.1f}%, Val: {last_val_acc:.1f}%)")
+                        pbar.write(f"Note: Subsequent red flags this epoch will be logged silently to JSON.")
+                        red_flag_triggered = True
             
             pbar.set_postfix(pbar_metrics)
         
         avg_loss = total_loss / num_batches
         avg_acc = 100 * total_correct / total_samples if total_samples > 0 else 0
-        return avg_loss, avg_acc
+        bonafide_acc = 100 * total_bonafide_correct / total_bonafide if total_bonafide > 0 else 0
+        spoof_acc = 100 * total_spoof_correct / total_spoof if total_spoof > 0 else 0
+        
+        grad_stats = {
+            'avg': np.mean(epoch_grad_norms) if epoch_grad_norms else 0,
+            'min': np.min(epoch_grad_norms) if epoch_grad_norms else 0,
+            'max': np.max(epoch_grad_norms) if epoch_grad_norms else 0
+        }
+        
+        overfit_stats = {
+            'red_flag_count': red_flag_count,
+            'max_gap_observed': max_gap_observed
+        }
+        
+        return avg_loss, avg_acc, bonafide_acc, spoof_acc, grad_stats, overfit_stats
     
     def validate(self, val_loader):
         self.model.eval()
@@ -1321,7 +1375,7 @@ class TrainAASIST3:
         for epoch in range(num_epochs):
             self.current_epoch = epoch
             
-            train_loss, train_acc = self.train_epoch(train_loader)
+            train_loss, train_acc, train_bn_acc, train_sp_acc, grad_stats, overfit_stats = self.train_epoch(train_loader)
             
             val_metrics = self.validate(val_loader)
             self.last_val_metrics = val_metrics
@@ -1341,10 +1395,14 @@ class TrainAASIST3:
             print(f" Metric      | Training | Validation")
             print(f" " + "-"*38)
             print(f" Loss        | {train_loss:8.4f} | {val_metrics['loss']:10.4f}")
-            print(f" Accuracy    | {train_acc:7.2f}% | {val_metrics['accuracy']:9.2f}%")
+            print(f" Total Acc   | {train_acc:7.2f}% | {val_metrics['accuracy']:9.2f}%")
+            print(f" Bonafide Acc| {train_bn_acc:7.2f}% | {val_metrics['bonafide_acc']:9.2f}%")
+            print(f" Spoof Acc   | {train_sp_acc:7.2f}% | {val_metrics['spoof_acc']:9.2f}%")
             print(f" Train-Val G | {gap:^8.2f}% | {'N/A':^10}")
             print(f" EER         | {'N/A':^8} | {val_metrics['eer']:9.2f}%")
             print(f" minDCF      | {'N/A':^8} | {val_metrics['min_dcf']:10.4f}")
+            print(f" " + "-"*40)
+            print(f" GRADIENT STATS: Avg: {grad_stats['avg']:.3f} | Min: {grad_stats['min']:.3f} | Max: {grad_stats['max']:.3f}")
             print(f" " + "-"*40)
             
             if self.scheduler is not None:
@@ -1359,7 +1417,18 @@ class TrainAASIST3:
             # Custom Saving Logic
             is_best = (val_metrics['eer'] < self.best_eer)
             self.save_checkpoint(epoch + 1, is_best=is_best)
-            self.save_epoch_log(epoch + 1, val_metrics, train_loss, train_acc)
+            
+            # Prepare extended training info for log
+            train_info = {
+                'loss': train_loss,
+                'accuracy': train_acc,
+                'bonafide_acc': train_bn_acc,
+                'spoof_acc': train_sp_acc,
+                'grad_stats': grad_stats,
+                'overfit_stats': overfit_stats,
+                'skipped_steps': self.skipped_steps
+            }
+            self.save_epoch_log(epoch + 1, val_metrics, train_info)
             
             if is_best:
                 self.best_eer = val_metrics['eer']
@@ -1397,28 +1466,42 @@ class TrainAASIST3:
         if self.scheduler is not None:
             checkpoint['scheduler_state_dict'] = self.scheduler.state_dict()
         
-        # Format: KANweightsEX.pth
+        # Format: KANweightsE[X].pth (original)
         filename = f"KANweightsE{epoch}.pth"
         filepath = os.path.join(self.weights_dir, filename)
         torch.save(checkpoint, filepath)
         
+        # New Standardized Naming: AASIST3_Epoch[X].pth in root
+        root_filename = f"AASIST3_Epoch{epoch}.pth"
+        torch.save(checkpoint, root_filename)
+        
         if is_best:
             best_path = os.path.join(self.weights_dir, "KANweights_best.pth")
             torch.save(checkpoint, best_path)
+            # Also save best in root
+            torch.save(checkpoint, "aasist3_best.pth")
 
-    def save_epoch_log(self, epoch, metrics, train_loss, train_acc):
-        """Save detailed per-epoch metrics log."""
+    def save_epoch_log(self, epoch, val_metrics, train_info):
+        """Save detailed per-epoch metrics."""
         log_data = {
             'epoch': epoch,
-            'timestamp': datetime.now().isoformat(),
-            'train_metrics': {
-                'loss': train_loss,
-                'accuracy': train_acc
-            },
-            'val_metrics': metrics
+            'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            'train_loss': train_info['loss'] if isinstance(train_info, dict) else train_info,
+            'train_accuracy': train_info['accuracy'] if isinstance(train_info, dict) else 0,
+            'train_bonafide_acc': train_info.get('bonafide_acc', 0) if isinstance(train_info, dict) else 0,
+            'train_spoof_acc': train_info.get('spoof_acc', 0) if isinstance(train_info, dict) else 0,
+            'grad_stats': train_info.get('grad_stats', {}) if isinstance(train_info, dict) else {},
+            'overfit_stats': train_info.get('overfit_stats', {}) if isinstance(train_info, dict) else {},
+            'skipped_steps': train_info.get('skipped_steps', 0) if isinstance(train_info, dict) else self.skipped_steps,
+            'val_loss': val_metrics['loss'],
+            'val_accuracy': val_metrics['accuracy'],
+            'val_bonafide_acc': val_metrics.get('bonafide_acc', 0),
+            'val_spoof_acc': val_metrics.get('spoof_acc', 0),
+            'val_eer': val_metrics['eer'],
+            'val_min_dcf': val_metrics['min_dcf'],
+            'val_f1': val_metrics.get('f1', 0)
         }
         
-        # Format: EpochXLog.json
         filename = f"Epoch{epoch}Log.json"
         filepath = os.path.join(self.weights_dir, filename)
         with open(filepath, 'w') as f:
@@ -1427,7 +1510,7 @@ class TrainAASIST3:
     def load_checkpoint(self, filename):
         """Load model checkpoint."""
         filepath = os.path.join(self.checkpoint_dir, filename)
-        checkpoint = torch.load(filepath, map_location=self.device)
+        checkpoint = torch.load(filepath, map_location=self.device, weights_only=False)
         
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -1614,7 +1697,7 @@ def run_mel_training():
     parser.add_argument("--experiment_name", type=str, default="aasist3_mel_v1")
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--max_len", type=int, default=200)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--patience", type=int, default=10)

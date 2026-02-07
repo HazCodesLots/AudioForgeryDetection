@@ -1,0 +1,231 @@
+{
+    "project": "AudioForgeryDetection - RawGAT-ST",
+    "history": [
+        {
+            "epoch": 1,
+            "train_loss": 1.130258,
+            "train_acc": 63.17,
+            "val_loss": 1.033664,
+            "val_acc": 64.82,
+            "val_eer": 28.73
+        },
+        {
+            "epoch": 2,
+            "train_loss": 0.821490,
+            "train_acc": 75.75,
+            "val_loss": 0.745015,
+            "val_acc": 81.03,
+            "val_eer": 17.90
+        },
+        {
+            "epoch": 3,
+            "train_loss": 0.472890,
+            "train_acc": 90.50,
+            "val_loss": 0.328088,
+            "val_acc": 93.68,
+            "val_eer": 7.03
+        },
+        {
+            "epoch": 4,
+            "train_loss": 0.286647,
+            "train_acc": 95.94,
+            "val_loss": 0.216922,
+            "val_acc": 97.30,
+            "val_eer": 3.93
+        },
+        {
+            "epoch": 5,
+            "train_loss": 0.211062,
+            "train_acc": 97.70,
+            "val_loss": 0.184420,
+            "val_acc": 97.25,
+            "val_eer": 3.30
+        },
+        {
+            "epoch": 6,
+            "train_loss": 0.189340,
+            "train_acc": 98.34,
+            "val_loss": 0.188060,
+            "val_acc": 98.37,
+            "val_eer": 2.82
+        },
+        {
+            "epoch": 7,
+            "train_loss": 0.176615,
+            "train_acc": 98.44,
+            "val_loss": 0.345199,
+            "val_acc": 98.40,
+            "val_eer": 2.90
+        },
+        {
+            "epoch": 8,
+            "train_loss": 0.172720,
+            "train_acc": 98.74,
+            "val_loss": 0.112404,
+            "val_acc": 98.29,
+            "val_eer": 1.86
+        },
+        {
+            "epoch": 9,
+            "train_loss": 0.150361,
+            "train_acc": 98.98,
+            "val_loss": 0.354018,
+            "val_acc": 98.64,
+            "val_eer": 3.06
+        },
+        {
+            "epoch": 10,
+            "train_loss": 0.148339,
+            "train_acc": 99.12,
+            "val_loss": 0.182691,
+            "val_acc": 99.12,
+            "val_eer": 1.89
+        },
+        {
+            "epoch": 11,
+            "train_loss": 0.155757,
+            "train_acc": 99.09,
+            "val_loss": 0.111288,
+            "val_acc": 98.06,
+            "val_eer": 1.59
+        },
+        {
+            "epoch": 12,
+            "train_loss": 0.126437,
+            "train_acc": 99.23,
+            "val_loss": 0.336496,
+            "val_acc": 99.02,
+            "val_eer": 1.84
+        },
+        {
+            "epoch": 13,
+            "train_loss": 0.118016,
+            "train_acc": 99.27,
+            "val_loss": 0.183322,
+            "val_acc": 99.25,
+            "val_eer": 1.25
+        },
+        {
+            "epoch": 14,
+            "train_loss": 0.132281,
+            "train_acc": 99.25,
+            "val_loss": 0.314185,
+            "val_acc": 99.05,
+            "val_eer": 1.46
+        },
+        {
+            "epoch": 15,
+            "train_loss": 0.109965,
+            "train_acc": 99.37,
+            "val_loss": 0.126640,
+            "val_acc": 99.18,
+            "val_eer": 1.35
+        },
+        {
+            "epoch": 16,
+            "train_loss": 0.101135,
+            "train_acc": 99.45,
+            "val_loss": 0.110910,
+            "val_acc": 98.89,
+            "val_eer": 1.49
+        },
+        {
+            "epoch": 17,
+            "train_loss": 0.084465,
+            "train_acc": 99.54,
+            "val_loss": 0.663048,
+            "val_acc": 98.53,
+            "val_eer": 2.51
+        },
+        {
+            "epoch": 18,
+            "train_loss": 0.080127,
+            "train_acc": 99.65,
+            "val_loss": 0.131837,
+            "val_acc": 99.24,
+            "val_eer": 1.41
+        },
+        {
+            "epoch": 19,
+            "train_loss": 0.078396,
+            "train_acc": 99.60,
+            "val_loss": 0.110672,
+            "val_acc": 99.06,
+            "val_eer": 1.36
+        },
+        {
+            "epoch": 20,
+            "train_loss": 0.195026,
+            "train_acc": 98.82,
+            "val_loss": 0.314977,
+            "val_acc": 99.05,
+            "val_eer": 1.60,
+            "note": "Resumed with Augmentation"
+        },
+        {
+            "epoch": 21,
+            "train_loss": 0.152829,
+            "train_acc": 99.12,
+            "val_loss": 0.161812,
+            "val_acc": 99.34,
+            "val_eer": 1.73
+        },
+        {
+            "epoch": 22,
+            "train_loss": 0.134072,
+            "train_acc": 99.19,
+            "val_loss": 0.238686,
+            "val_acc": 99.22,
+            "val_eer": 1.61
+        },
+        {
+            "epoch": 23,
+            "train_loss": 0.114409,
+            "train_acc": 99.34,
+            "val_loss": 0.203561,
+            "val_acc": 99.30,
+            "val_eer": 1.53
+        },
+        {
+            "epoch": 24,
+            "train_loss": 0.116772,
+            "train_acc": 99.34,
+            "val_loss": 0.587183,
+            "val_acc": 98.74,
+            "val_eer": 2.49
+        },
+        {
+            "epoch": 25,
+            "train_loss": 0.110527,
+            "train_acc": 99.43,
+            "val_loss": 0.260586,
+            "val_acc": 99.31,
+            "val_eer": 1.92
+        },
+        {
+            "epoch": 26,
+            "train_loss": 0.100360,
+            "train_acc": 99.42,
+            "val_loss": 0.145630,
+            "val_acc": 99.27,
+            "val_eer": 1.46
+        },
+        {
+            "epoch": 27,
+            "train_loss": 0.073669,
+            "train_acc": 99.56,
+            "val_loss": 0.112970,
+            "val_acc": 99.61,
+            "val_eer": 0.73,
+            "note": "Best EER"
+        },
+        {
+            "epoch": 28,
+            "train_loss": 0.078994,
+            "train_acc": 99.60,
+            "val_loss": 0.165060,
+            "val_acc": 99.42,
+            "val_eer": 1.22
+        }
+    ]
+}
