@@ -1,5 +1,0 @@
-__pycache__/
-*.pyc
-*.pyo
-.continue/agents/new-config.yaml
-.gitignore
