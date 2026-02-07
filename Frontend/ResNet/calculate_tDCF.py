@@ -50,25 +50,38 @@ def compute_tDCF_legacy(bonafide_score_cm, spoof_score_cm, Pfa_asv, Pmiss_asv, P
          
     C1 = cost_model['Ptar'] * cost_model['Cmiss'] * (1 - Pmiss_asv)
          
-    C2 = cost_model['Pspoof'] * cost_model['Cfa_spoof'] * (1 - Pmiss_spoof_asv)
+    C2 = cost_model['Pspoof'] * cost_model['Cfa_spoof'] * Pmiss_spoof_asv
     
     if C0 == 0: 
         return 0.0
 
+    # Sort CM scores for min t-DCF
     scores = np.concatenate((bonafide_score_cm, spoof_score_cm))
     labels = np.concatenate((np.ones(len(bonafide_score_cm)), np.zeros(len(spoof_score_cm))))
+    
+    # Sort descending: high score = more bonafide
     indices = np.argsort(scores)[::-1]
     sorted_labels = labels[indices]
-
+    
     n_bonafide = len(bonafide_score_cm)
     n_spoof = len(spoof_score_cm)
+    
     tps = np.cumsum(sorted_labels)
     fps = np.cumsum(1 - sorted_labels)
+    
     Pmiss_cm = (n_bonafide - tps) / n_bonafide
     Pfa_cm = fps / n_spoof
-
-    tDCF_raw = C1 * Pmiss_cm + C2 * Pfa_cm
-    tDCF_norm = tDCF_raw / t_DCF_default
+    
+    # Tandem DCF at each operation point
+    tDCF = C1 * Pmiss_cm + C2 * Pfa_cm + C0
+    
+    # Normalization: best of "always accept" or "always reject"
+    # Always Accept: Pmiss_cm=0, Pfa_cm=1 -> DCF = C2 + C0
+    # Always Reject: Pmiss_cm=1, Pfa_cm=0 -> DCF = C1 + C0
+    tDCF_default = min(C1 + C0, C2 + C0)
+    
+    tDCF_norm = tDCF / tDCF_default
+    
     return float(np.min(tDCF_norm))
 
 def compute_min_tDCF(cm_scores, audio_ids, asv_data, cost_model=None):

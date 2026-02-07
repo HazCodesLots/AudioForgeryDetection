@@ -501,7 +501,8 @@ USE_RESNET34 = False  # set True for more capacity (may help A17 / eval); if Tru
 WEIGHTS_DIR = Path(r"n:\AudioForgeryDetection\Frontend\ResNet\ResNet-SEWeights_v4")
 WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
 SAVE_PATH = WEIGHTS_DIR / "resnet_se_asvspoof2019_v4.pth"
-SAVE_PATH_BEST_TDCF = WEIGHTS_DIR / "resnet_se_best_tdcf.pth"  # best by dev t-minDCF (often best eval minDCF)
+SAVE_PATH_BEST_TDCF = WEIGHTS_DIR / "resnet_se_best_tdcf.pth"
+HISTORY_PATH = WEIGHTS_DIR / "history_v4.json"
 
 
 class FocalLoss(nn.Module):
@@ -519,7 +520,7 @@ class FocalLoss(nn.Module):
 
 
 def compute_eer(y_true, y_score):
-    fpr, tpr, thresholds = roc_curve(y_true, y_score, pos_label=0)
+    fpr, tpr, thresholds = roc_curve(y_true, y_score, pos_label=1)
     fnr = 1 - tpr
     eer_idx = np.nanargmin(np.absolute(fnr - fpr))
     eer = fpr[eer_idx] * 100
@@ -587,7 +588,7 @@ def evaluate(model, loader, criterion, device, asv_metrics=None, epoch=-1, final
         _, predicted = outputs.max(1)
         total += labels.size(0)
         correct += predicted.eq(labels).sum().item()
-        probs = torch.softmax(outputs, dim=1)[:, 0]
+        probs = torch.softmax(outputs, dim=1)[:, 1]
         all_scores.extend(probs.cpu().numpy())
         all_labels.extend(labels.cpu().numpy())
         all_audio_ids.extend(audio_ids)
