@@ -12,13 +12,13 @@ This model excels at audio tasks requiring rich feature extraction and long-rang
 - **Audio Event Detection**: Multi-label tagging of simultaneous audio events
 - **Speaker Identification**: Multi-class speaker recognition tasks
 
-## Core Components
+## Key Features
 
 - **Multi-Scale Feature Extraction**: ConvNeXt captures local patterns and textures from mel-spectrograms
 - **Temporal Modeling**: Multi-head self-attention handles long-range dependencies across time
 - **Feature Relationship Learning**: Graph neural networks model co-occurrence patterns and feature interactions
 
-
+## Core Components
 
 ### 1. ConvNeXt1D Backbone
 - **Purpose**: Feature extraction from mel-spectrograms
@@ -63,23 +63,11 @@ Total parameters: ~30M (estimated)
 Input shape: (batch_size, 1, 64, 250)  # mel-spectrogram
 Output shape: (batch_size, num_classes)  # logits
 ```
+## Training Metrics
 
-## Data Preprocessing
+<img width="1693" height="690" alt="image" src="https://github.com/user-attachments/assets/2a7e54dc-4440-42d2-88d8-f67ea0c86539" />
 
-- Sample rate: 16 kHz
+## Custom Evaluation Performance 
 
-- Mel-spectrogram parameters:
-
-- n_fft: 512
-
-- hop_length: 160
-
-- win_length: 400
-
-- n_mels: 64
-
-- fmin: 20 Hz, fmax: 8000 Hz
-
-- Normalization: mean/std standardization
-
-- Padding/truncation to 250 time frames
+<img width="691" height="731" alt="image" src="https://github.com/user-attachments/assets/d48cfefa-da92-40fa-931b-addbf5e5a744" />
+<img width="738" height="523" alt="image" src="https://github.com/user-attachments/assets/2a523c73-40b8-49ea-a24b-6c8bce707e67" />
