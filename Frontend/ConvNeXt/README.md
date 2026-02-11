@@ -12,13 +12,13 @@ This model excels at audio tasks requiring rich feature extraction and long-rang
 - **Audio Event Detection**: Multi-label tagging of simultaneous audio events
 - **Speaker Identification**: Multi-class speaker recognition tasks
 
-## Why This Architecture?
+## Core Components
 
 - **Multi-Scale Feature Extraction**: ConvNeXt captures local patterns and textures from mel-spectrograms
 - **Temporal Modeling**: Multi-head self-attention handles long-range dependencies across time
 - **Feature Relationship Learning**: Graph neural networks model co-occurrence patterns and feature interactions
 
-## Core Components
+
 
 ### 1. ConvNeXt1D Backbone
 - **Purpose**: Feature extraction from mel-spectrograms
