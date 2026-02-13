@@ -588,7 +588,7 @@ def evaluate(model, loader, criterion, device, asv_metrics=None, epoch=-1, final
         _, predicted = outputs.max(1)
         total += labels.size(0)
         correct += predicted.eq(labels).sum().item()
-        probs = torch.softmax(outputs, dim=1)[:, 1]
+        probs = torch.softmax(outputs, dim=1)[:, 0]
         all_scores.extend(probs.cpu().numpy())
         all_labels.extend(labels.cpu().numpy())
         all_audio_ids.extend(audio_ids)

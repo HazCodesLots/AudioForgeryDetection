@@ -84,7 +84,7 @@ def compute_tDCF_legacy(bonafide_score_cm, spoof_score_cm, Pfa_asv, Pmiss_asv, P
     
     return float(np.min(tDCF_norm))
 
-def compute_min_tDCF(cm_scores, audio_ids, asv_data, cost_model=None):
+def compute_min_tDCF(cm_scores, audio_ids, asv_data, cost_model=None, threshold=None):
     if cost_model is None:
         cost_model = {
             'Ptar': 0.05,
@@ -131,13 +131,17 @@ def compute_min_tDCF(cm_scores, audio_ids, asv_data, cost_model=None):
     if len(bonafide_cm) == 0 or len(spoof_cm) == 0:
         return 1.0
     
-    all_asv = np.concatenate([bonafide_asv, spoof_asv])
-    all_labels = np.concatenate([np.ones(len(bonafide_asv)), np.zeros(len(spoof_asv))])
-    from sklearn.metrics import roc_curve
-    fpr, tpr, asv_thresholds = roc_curve(all_labels, all_asv, pos_label=1)
-    fnr = 1 - tpr
-    eer_idx = np.nanargmin(np.absolute(fnr - fpr))
-    asv_threshold = asv_thresholds[eer_idx]
+    # Use provided threshold or compute ASV threshold
+    if threshold is not None:
+        asv_threshold = threshold
+    else:
+        all_asv = np.concatenate([bonafide_asv, spoof_asv])
+        all_labels = np.concatenate([np.ones(len(bonafide_asv)), np.zeros(len(spoof_asv))])
+        from sklearn.metrics import roc_curve
+        fpr, tpr, asv_thresholds = roc_curve(all_labels, all_asv, pos_label=1)
+        fnr = 1 - tpr
+        eer_idx = np.nanargmin(np.absolute(fnr - fpr))
+        asv_threshold = asv_thresholds[eer_idx]
     
     Pmiss_asv = (target_asv < asv_threshold).mean() if len(target_asv) > 0 else 0.0
     Pfa_asv = (nontarget_asv >= asv_threshold).mean() if len(nontarget_asv) > 0 else 0.0

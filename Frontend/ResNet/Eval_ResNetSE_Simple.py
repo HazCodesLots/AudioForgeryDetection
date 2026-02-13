@@ -1,0 +1,318 @@
+import os
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+import soundfile as sf
+import scipy.signal
+import scipy.fftpack
+from pathlib import Path
+from tqdm import tqdm
+from sklearn.metrics import roc_curve, auc
+import matplotlib.pyplot as plt
+import json
+import pandas as pd
+from calculate_tDCF import load_asv_metrics, compute_min_tDCF
+
+# --- Feature Extraction ---
+
+def delta(feat, N=2):
+    """Compute delta features from a feature matrix."""
+    if N < 1:
+        raise ValueError("N must be at least 1")
+    denom = 2 * sum([i**2 for i in range(1, N + 1)])
+    padded = np.pad(feat, ((N, N), (0, 0)), mode='edge')
+    delta_feat = np.zeros_like(feat)
+    for t in range(feat.shape[0]):
+        for n in range(1, N + 1):
+            delta_feat[t] += n * (padded[t + N + n] - padded[t + N - n])
+    return delta_feat / denom
+
+def extract_lfcc(signal, samplerate=16000, n_fft=512, n_filters=70, n_ceps=70,
+                 winlen=0.025, winstep=0.01, preemph=0.97, with_delta=True):
+    signal = scipy.signal.lfilter([1, -preemph], 1, signal)
+    frame_len = int(winlen * samplerate)
+    frame_step = int(winstep * samplerate)
+    signal_length = len(signal)
+    num_frames = max(1, 1 + int((signal_length - frame_len) / frame_step))
+    pad_length = (num_frames - 1) * frame_step + frame_len
+    if pad_length > signal_length:
+        signal = np.pad(signal, (0, pad_length - signal_length), mode='constant')
+    frames = np.zeros((num_frames, frame_len))
+    for i in range(num_frames):
+        start = i * frame_step
+        frames[i] = signal[start:start + frame_len] * np.hamming(frame_len)
+    mag_frames = np.absolute(np.fft.rfft(frames, n=n_fft))
+    pow_frames = (1.0 / n_fft) * (mag_frames ** 2)
+    hz_points = np.linspace(0, samplerate / 2, n_filters + 2)
+    bins = np.floor((n_fft + 1) * hz_points / samplerate).astype(int)
+    filterbank = np.zeros((n_filters, int(n_fft / 2 + 1)))
+    for m in range(1, n_filters + 1):
+        f_m_minus, f_m, f_m_plus = bins[m - 1], bins[m], bins[m + 1]
+        for k in range(f_m_minus, f_m):
+            filterbank[m - 1, k] = (k - f_m_minus) / (f_m - f_m_minus + 1e-8)
+        for k in range(f_m, f_m_plus):
+            filterbank[m - 1, k] = (f_m_plus - k) / (f_m_plus - f_m + 1e-8)
+    feat = np.dot(pow_frames, filterbank.T)
+    feat = np.where(feat == 0, np.finfo(float).eps, feat)
+    log_feat = np.log(feat)
+    static = scipy.fftpack.dct(log_feat, type=2, axis=1, norm='ortho')[:, :n_ceps]
+    if not with_delta: return static
+    d1 = delta(static)
+    d2 = delta(d1)
+    return np.stack([static, d1, d2], axis=0)
+
+# --- Original Model Architecture (without temporal attention) ---
+
+class SEBlock(nn.Module):
+    def __init__(self, channels, reduction=16):
+        super(SEBlock, self).__init__()
+        self.squeeze = nn.AdaptiveAvgPool2d(1)
+        self.excitation = nn.Sequential(
+            nn.Linear(channels, channels // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channels // reduction, channels, bias=False),
+            nn.Sigmoid()
+        )
+    def forward(self, x):
+        batch, channels, _, _ = x.size()
+        y = self.squeeze(x).view(batch, channels)
+        y = self.excitation(y).view(batch, channels, 1, 1)
+        return x * y.expand_as(x)
+
+class SEBasicBlock(nn.Module):
+    expansion = 1
+    def __init__(self, in_planes, planes, stride=1, downsample=None, reduction=16):
+        super(SEBasicBlock, self).__init__()
+        self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(planes)
+        self.se = SEBlock(planes, reduction)
+        self.downsample = downsample
+    def forward(self, x):
+        identity = x
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out = self.se(out)
+        if self.downsample is not None: identity = self.downsample(x)
+        out += identity
+        out = self.relu(out)
+        return out
+
+class ResNetSE(nn.Module):
+    def __init__(self, block, layers, num_classes=2, in_channels=1, reduction=16, base_channels=64):
+        super(ResNetSE, self).__init__()
+        self.inplanes = base_channels
+        self.reduction = reduction
+        self.conv1 = nn.Conv2d(in_channels, base_channels, kernel_size=7, stride=2, padding=3, bias=False)
+        self.bn1 = nn.BatchNorm2d(base_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        self.layer1 = self._make_layer(block, base_channels, layers[0])
+        self.layer2 = self._make_layer(block, base_channels * 2, layers[1], stride=2)
+        self.layer3 = self._make_layer(block, base_channels * 4, layers[2], stride=2)
+        self.layer4 = self._make_layer(block, base_channels * 8, layers[3], stride=2)
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Linear(base_channels * 8 * block.expansion, num_classes)
+    def _make_layer(self, block, planes, blocks, stride=1):
+        downsample = None
+        if stride != 1 or self.inplanes != planes * block.expansion:
+            downsample = nn.Sequential(
+                nn.Conv2d(self.inplanes, planes * block.expansion, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(planes * block.expansion)
+            )
+        layers = []
+        layers.append(block(self.inplanes, planes, stride, downsample, self.reduction))
+        self.inplanes = planes * block.expansion
+        for _ in range(1, blocks): layers.append(block(self.inplanes, planes, reduction=self.reduction))
+        return nn.Sequential(*layers)
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.fc(x)
+        return x
+
+def resnet18_se(num_classes=2, **kwargs):
+    return ResNetSE(SEBasicBlock, [2, 2, 2, 2], num_classes=num_classes, **kwargs)
+
+class ASVspoof2019Eval(Dataset):
+    def __init__(self, audio_dir, protocol_path, max_len=400, n_ceps=70, sample_rate=16000):
+        self.audio_dir = Path(audio_dir)
+        self.max_len = max_len
+        self.n_ceps = n_ceps
+        self.sample_rate = sample_rate
+        self.samples = []
+        with open(protocol_path, 'r') as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) >= 5:
+                    audio_id, attack_type, key = parts[1], parts[3], parts[4]
+                    label = 1 if key == 'bonafide' else 0
+                    audio_path = self.audio_dir / f"{audio_id}.flac"
+                    if audio_path.exists():
+                        self.samples.append({'path': audio_path, 'label': label, 'audio_id': audio_id, 'attack_type': attack_type})
+        print(f"[EVAL] Loaded {len(self.samples)} samples.")
+
+    def __len__(self): return len(self.samples)
+
+    def __getitem__(self, idx):
+        sample = self.samples[idx]
+        try:
+            signal, sr = sf.read(str(sample['path']))
+            if sr != self.sample_rate:
+                import librosa
+                signal = librosa.resample(signal, orig_sr=sr, target_sr=self.sample_rate)
+            lfcc = extract_lfcc(signal, samplerate=self.sample_rate, n_ceps=self.n_ceps) # [3, time, n_ceps]
+            
+            # Pad/Crop to match model input
+            if lfcc.shape[1] < self.max_len:
+                pad_width = self.max_len - lfcc.shape[1]
+                lfcc = np.pad(lfcc, ((0, 0), (0, pad_width), (0, 0)), mode='constant')
+            else:
+                lfcc = lfcc[:, :self.max_len, :]
+
+            # Average the 3 channels to 1 channel for the model
+            lfcc_1ch = np.mean(lfcc, axis=0, keepdims=True)  # [1, time, n_ceps]
+
+            return torch.tensor(lfcc_1ch, dtype=torch.float32), torch.tensor(sample['label']), sample['attack_type'], sample['audio_id']
+        except Exception as e:
+            print(f"[ERROR] Loading {sample['audio_id']}: {e}")
+            return torch.zeros(3, self.max_len, self.n_ceps), torch.tensor(sample['label']), sample['attack_type'], sample['audio_id']
+
+def compute_eer(y_true, y_score):
+    fpr, tpr, thresholds = roc_curve(y_true, y_score, pos_label=1)
+    fnr = 1 - tpr
+    eer_idx = np.nanargmin(np.absolute(fnr - fpr))
+    return fpr[eer_idx] * 100
+
+def find_optimal_threshold_tDCF(scores, audio_ids, asv_metrics, p_target=0.05, c_miss=1, c_fa=1):
+    """
+    Find the optimal threshold that minimizes tDCF
+    Note: scores are bonafide probabilities, so we need to invert them for tDCF
+    """
+    # Calculate effective prior
+    p_target *= 0.998
+    p_non_target = 0.002
+    
+    # Calculate costs
+    c_det_target = c_miss * p_target / p_target
+    c_det_non_target = c_fa * p_non_target / (1 - p_target)
+    
+    # Try different thresholds
+    thresholds = np.linspace(0, 1, 1000)
+    min_tdcf = float('inf')
+    best_threshold = 0.5
+    
+    for threshold in thresholds:
+        # Invert scores for tDCF (high score = more likely spoof)
+        inverted_scores = 1.0 - scores
+        # Calculate tDCF for this threshold
+        tdcf = compute_min_tDCF(inverted_scores, audio_ids, asv_metrics, threshold=threshold)
+        
+        if tdcf < min_tdcf:
+            min_tdcf = tdcf
+            best_threshold = threshold
+    
+    return best_threshold, min_tdcf
+
+@torch.no_grad()
+def run_evaluation():
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+
+    DATA_ROOT = Path(r"N:\ASVspoof2019\LA")
+    EVAL_AUDIO_DIR = DATA_ROOT / "ASVspoof2019_LA_eval" / "flac"
+    EVAL_PROTOCOL = DATA_ROOT / "ASVspoof2019_LA_cm_protocols" / "ASVspoof2019.LA.cm.eval.trl.txt"
+    
+    BATCH_SIZE, MAX_LEN, N_CEPS = 64, 400, 70
+    
+    WEIGHTS_PATH = r"n:\AudioForgeryDetection\Frontend\ResNet\ResNet-SEWeights_v4\resnet_se_asvspoof2019.pth"
+
+    model = resnet18_se(num_classes=2, in_channels=1).to(device)  # 1 channel for original model
+    eval_dataset = ASVspoof2019Eval(EVAL_AUDIO_DIR, EVAL_PROTOCOL, max_len=MAX_LEN, n_ceps=N_CEPS)
+    eval_loader = DataLoader(eval_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
+
+    # Load ASV Metrics for Eval set
+    ASV_SCORES_FILE = DATA_ROOT / "ASVspoof2019_LA_asv_scores" / "ASVspoof2019.LA.asv.eval.gi.trl.scores.txt"
+    ASV_PROTOCOL_FILE = DATA_ROOT / "ASVspoof2019_LA_asv_protocols" / "ASVspoof2019.LA.asv.eval.gi.trl.txt"
+    print("Loading ASV metrics for Eval set...")
+    asv_metrics = load_asv_metrics(ASV_SCORES_FILE, ASV_PROTOCOL_FILE)
+
+    # Load model
+    checkpoint = torch.load(WEIGHTS_PATH, map_location=device, weights_only=False)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model.eval()
+    eer_val = checkpoint.get('best_eer', checkpoint.get('val_eer', 0.0))
+    print(f"\nLoaded model (Epoch {checkpoint['epoch']+1}, Dev EER: {eer_val:.2f}%)")
+
+    # Evaluate
+    results = []
+    with torch.no_grad():
+        for inputs, labels, attack_types, audio_ids in tqdm(eval_loader, desc="Evaluating"):
+            inputs = inputs.to(device)
+            outputs = model(inputs)
+            probs = torch.softmax(outputs, dim=1)[:, 1].cpu().numpy()  # Extract bonafide probability (model was trained with this bug)
+            for i in range(len(probs)):
+                results.append({'audio_id': audio_ids[i], 'attack_type': attack_types[i], 'label': labels[i].item(), 'score': probs[i]})
+    
+    df = pd.DataFrame(results)
+    global_eer = compute_eer(df['label'], df['score'])
+    
+    # Calibrate threshold for optimal tDCF
+    print("Finding optimal threshold for tDCF calibration...")
+    best_threshold, calibrated_tdcf = find_optimal_threshold_tDCF(df['score'].values, df['audio_id'].values, asv_metrics)
+    
+    # Original tDCF calculation (inverted scores - this was working better)
+    inverted_scores = 1.0 - df['score'].values
+    original_tdcf = compute_min_tDCF(inverted_scores, df['audio_id'].values, asv_metrics)
+    
+    # Also try calibrated threshold with inverted scores (corrected approach)
+    corrected_scores = 1.0 - df['score'].values
+    corrected_tdcf = compute_min_tDCF(corrected_scores, df['audio_id'].values, asv_metrics, threshold=best_threshold)
+    
+    print(f"\nGLOBAL EVAL EER: {global_eer:.4f}%")
+    print(f"Original min_tDCF: {original_tdcf:.4f}")
+    print(f"Calibrated min_tDCF (threshold={best_threshold:.4f}): {calibrated_tdcf:.4f}")
+
+    attack_groups = df.groupby('attack_type')
+    bonafide_scores = df[df['label'] == 1]['score'].values
+    
+    attack_eers = {}
+    for attack, group in attack_groups:
+        if attack == '-': continue
+        attack_scores = group['score'].values
+        y_true = np.concatenate([np.ones(len(bonafide_scores)), np.zeros(len(attack_scores))])
+        y_score = np.concatenate([bonafide_scores, attack_scores])
+        attack_eer = compute_eer(y_true, y_score)
+        attack_eers[attack] = attack_eer
+        print(f"  {attack:<5} EER: {attack_eer:.4f}%")
+    
+    final_results = {
+        "Global_EER": global_eer,
+        "Original_min_tDCF": original_tdcf,
+        "Calibrated_min_tDCF": calibrated_tdcf,
+        "Optimal_Threshold": best_threshold,
+        "Attack_EERs": attack_eers
+    }
+    
+    # Save to JSON
+    with open("eval_results_simple.json", "w") as f:
+        json.dump(final_results, f, indent=4)
+    print("Saved results to eval_results_simple.json")
+
+if __name__ == "__main__":
+    run_evaluation()

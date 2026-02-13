@@ -311,7 +311,7 @@ def evaluate_epoch(epoch_path, model, device, eval_loader):
         for inputs, labels, attack_types, audio_ids in tqdm(eval_loader, desc=f"Eval {epoch_path}"):
             inputs = inputs.to(device)
             outputs = model(inputs)
-            probs = torch.softmax(outputs, dim=1)[:, 1].cpu().numpy()
+            probs = torch.softmax(outputs, dim=1)[:, 0].cpu().numpy()
             for i in range(len(probs)):
                 results.append({'audio_id': audio_ids[i], 'attack_type': attack_types[i], 'label': labels[i].item(), 'score': probs[i]})
     
@@ -329,7 +329,7 @@ def run_evaluation():
     
     WEIGHTS_DIR = Path(r"n:\AudioForgeryDetection\Frontend\ResNet\ResNet-SEWeights_v4")
 
-    model = resnet18_se(num_classes=2, in_channels=CHANNELS).to(device)
+    model = resnet18_se(num_classes=2, in_channels=1).to(device)
     eval_dataset = ASVspoof2019Eval(EVAL_AUDIO_DIR, EVAL_PROTOCOL, max_len=MAX_LEN, n_ceps=N_CEPS)
     eval_loader = DataLoader(eval_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
 
@@ -340,8 +340,8 @@ def run_evaluation():
     asv_metrics = load_asv_metrics(ASV_SCORES_FILE, ASV_PROTOCOL_FILE)
 
 
-    # Evaluate all epochs 1-30 in new weights directory
-    epochs_to_test = [WEIGHTS_DIR / f"Epoch{i}.pth" for i in range(1, 31)]
+    # Evaluate using the main model file
+    epochs_to_test = [WEIGHTS_DIR / "resnet_se_asvspoof2019.pth"]
     
     final_results = {}
     
