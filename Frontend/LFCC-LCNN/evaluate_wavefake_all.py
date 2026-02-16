@@ -23,9 +23,9 @@ def scenario_c_multi_vocoder(splits_json, device='cuda'):
     """
     Evaluate pre-trained model on all vocoders
     """
-    print("\n" + "="*70)
+
     print("SCENARIO C: MULTI-VOCODER EVALUATION (ALL VOCODERS)")
-    print("="*70)
+
     
     # Load data
     train_loader, test_loader = create_loaders_from_splits(
@@ -47,9 +47,9 @@ def scenario_c_multi_vocoder(splits_json, device='cuda'):
     print(f"Total: {total_size}")
     
     if abs(train_ratio - 0.8) > 0.05 or abs(test_ratio - 0.2) > 0.05:
-        print("⚠ WARNING: Not a proper 80/20 split!")
+        print(" WARNING: Not a proper 80/20 split!")
     else:
-        print("✓ Proper 80/20 split confirmed")
+        print(" Proper 80/20 split confirmed")
     
     # Class distribution check
     train_dataset = train_loader.dataset
@@ -74,7 +74,7 @@ def scenario_c_multi_vocoder(splits_json, device='cuda'):
     checkpoint = torch.load(weight_path, map_location=device)
     model.load_state_dict(checkpoint['model_state_dict'])
     lfcc_extractor.load_state_dict(checkpoint['lfcc_extractor_state_dict'])
-    print(f"✓ Checkpoint loaded - Epoch: {checkpoint.get('epoch', 'Unknown') + 1}, "
+    print(f" Checkpoint loaded - Epoch: {checkpoint.get('epoch', 'Unknown') + 1}, "
           f"Previous EER: {checkpoint.get('val_eer', 'Unknown'):.4f}%")
     
     # Evaluate
@@ -89,13 +89,10 @@ def scenario_c_multi_vocoder(splits_json, device='cuda'):
     
     _, acc, auc, eer = trainer.validate(desc='Evaluating')
     
-    print("\n" + "="*70)
     print("SCENARIO C RESULTS: ALL-VOCODERS EVALUATION")
-    print("="*70)
     print(f"Test Accuracy: {acc*100:.2f}%")
     print(f"Test AUC:      {auc:.4f}")
     print(f"Test EER:      {eer:.4f}%")
-    print("="*70)
     
     return {'accuracy': acc, 'auc': auc, 'eer': eer}
 

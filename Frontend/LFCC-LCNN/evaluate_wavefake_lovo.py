@@ -12,9 +12,7 @@ def evaluate_lovo_checkpoints(splits_json, device='cuda'):
     """
     Load the 10 LOVO checkpoints and verify their performance on the held-out vocoders.
     """
-    print("\n" + "="*70)
     print("SCENARIO B: FINAL LOVO EVALUATION (10-FOLD)")
-    print("="*70)
     
     with open(splits_json, 'r', encoding='utf-8') as f:
         splits = json.load(f)
@@ -26,7 +24,6 @@ def evaluate_lovo_checkpoints(splits_json, device='cuda'):
     for fold_idx, held_out_vocoder in enumerate(vocoders, 1):
         print(f"\n--- [FOLD {fold_idx}/10] Evaluating held-out: {held_out_vocoder} ---")
         
-        # 1. Prepare Data Loader (Full held-out vocoder + Real test set)
         test_dataset = WaveFakeDatasetFixed(
             splits_json=splits_json,
             split_type='all', 
@@ -40,26 +37,23 @@ def evaluate_lovo_checkpoints(splits_json, device='cuda'):
             num_workers=4, pin_memory=True
         )
         
-        # 2. Setup Model
         model = LCNN(n_lfcc=60, num_classes=2).to(device)
         
-        # 3. Load Weights
-        # Path used in train_wavefake_lovo.py:
+
         weight_path = os.path.join(script_dir, 'weights', 'protocol', f'lovo_{held_out_vocoder}', f'lovo_{held_out_vocoder}_best.pt')
         
         if not os.path.exists(weight_path):
-            print(f"  🚨 Error: Weights not found at {weight_path}")
+            print(f"  Error: Weights not found at {weight_path}")
             continue
             
-        print(f"  ✓ Loading weights: {os.path.basename(weight_path)}")
+        print(f"  Loading weights: {os.path.basename(weight_path)}")
         checkpoint = torch.load(weight_path, map_location=device, weights_only=False)
         model.load_state_dict(checkpoint['model_state_dict'])
         
-        # 4. Evaluate
         trainer = LFCCLCNNTrainer(
             model=model,
             lfcc_extractor=LFCCExtractor(n_lfcc=60, n_filter=60),
-            train_loader=None, # Not needed for eval
+            train_loader=None,
             val_loader=test_loader,
             device=device
         )
@@ -71,14 +65,10 @@ def evaluate_lovo_checkpoints(splits_json, device='cuda'):
             'acc': acc,
             'auc': auc
         }
-        print(f"  ✓ Result - EER: {eer:.4f}%, Acc: {acc*100:.2f}%")
+        print(f"  Result - EER: {eer:.4f}%, Acc: {acc*100:.2f}%")
 
-    # 5. Print Final Report
-    print("\n" + "="*70)
     print("FINAL SCENARIO B (LOVO) VERIFICATION REPORT")
-    print("="*70)
     print(f"{'Held-out Vocoder':<30} {'EER':<10} {'Accuracy':<10}")
-    print("-" * 70)
     
     eers = []
     for k in sorted(results.keys()):
@@ -86,9 +76,21 @@ def evaluate_lovo_checkpoints(splits_json, device='cuda'):
         print(f"{k:<30} {v['eer']:>7.4f}%  {v['acc']*100:>8.2f}%")
         eers.append(v['eer'])
         
-    print("-" * 70)
-    print(f"{'AVERAGE (aEER)':<30} {np.mean(eers):>7.4f}%")
-    print("="*70)
+    final_avg = np.mean(eers)
+    print(f"{'AVERAGE (aEER)':<30} {final_avg:>7.4f}%")
+
+    output_json = os.path.join(script_dir, 'weights', 'protocol', 'wavefake_lovo_verified_results.json')
+    save_data = {
+        "summary": {
+            "average_eer": float(final_avg),
+            "num_folds": len(eers),
+            "status": "verified_final"
+        },
+        "folds": results
+    }
+    with open(output_json, 'w') as f:
+        json.dump(save_data, f, indent=4)
+    print(f"\n Verified LOVO results saved to: {output_json}")
 
 if __name__ == '__main__':
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')

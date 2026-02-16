@@ -29,10 +29,9 @@ class LFCCLCNNTrainer:
             'epochs': [],
             'train_loss': [], 'train_acc': [],
             'val_loss': [], 'val_acc': [], 'val_auc': [], 'val_eer': [],
-            'learning_rates': []  # Track LR over epochs
+            'learning_rates': []
         }
         
-        # Optimizer and loss
         self.optimizer = optim.Adam(
             model.parameters(),
             lr=lr,
@@ -45,7 +44,6 @@ class LFCCLCNNTrainer:
         else:
             self.criterion = nn.CrossEntropyLoss()
         
-        # Scheduler will be initialized in train() method
         self.scheduler = None
         
     def train_epoch(self, grad_clip=1.0):
@@ -59,22 +57,18 @@ class LFCCLCNNTrainer:
             lfcc = lfcc.to(self.device)
             labels = labels.to(self.device)
             
-            # Forward pass
             lfcc = lfcc.unsqueeze(1)
             outputs = self.model(lfcc)
             loss = self.criterion(outputs, labels)
             
-            # Backward pass
             self.optimizer.zero_grad()
             loss.backward()
             
-            # Gradient clipping to prevent explosion
             if grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip)
             
             self.optimizer.step()
             
-            # Metrics
             total_loss += loss.item()
             preds = torch.argmax(outputs, dim=1)
             all_preds.extend(preds.cpu().numpy())
@@ -108,14 +102,13 @@ class LFCCLCNNTrainer:
                 preds = torch.argmax(outputs, dim=1)
                 
                 all_preds.extend(preds.cpu().numpy())
-                all_scores.extend(probs[:, 1].cpu().numpy())  # Score for REAL class
+                all_scores.extend(probs[:, 1].cpu().numpy())
                 all_labels.extend(labels.cpu().numpy())
         
         avg_loss = total_loss / len(self.val_loader)
         accuracy = accuracy_score(all_labels, all_preds)
         auc = roc_auc_score(all_labels, all_scores)
         
-        # Calculate EER (Equal Error Rate)
         eer = self.calculate_eer(all_labels, all_scores)
         
         return avg_loss, accuracy, auc, eer
@@ -145,12 +138,10 @@ class LFCCLCNNTrainer:
             'val_acc': val_acc
         }
         
-        # Save epoch checkpoint
         epoch_path = os.path.join(checkpoint_dir, f'epoch_{epoch+1:03d}.pt')
         torch.save(state, epoch_path)
         print(f"Saved epoch {epoch+1} weights to {epoch_path}")
         
-        # Additionally save best model
         if is_best:
             torch.save(state, save_path)
             print(f"Saved best model with EER: {val_eer:.4f}%")
@@ -159,11 +150,9 @@ class LFCCLCNNTrainer:
         import json
         import os
         
-        # Save as both old format and new format
         base_name = os.path.splitext(os.path.basename(save_path))[0]
         metrics_dir = os.path.dirname(save_path)
         
-        # Simple format (your original)
         simple_metrics = {
             'train_loss': self.history['train_loss'],
             'train_acc': self.history['train_acc'],
@@ -177,7 +166,6 @@ class LFCCLCNNTrainer:
         with open(simple_path, 'w') as f:
             json.dump(simple_metrics, f, indent=4)
         
-        # Detailed format with LR tracking
         detailed_metrics = {
             "epochs": [
                 {
@@ -210,7 +198,6 @@ class LFCCLCNNTrainer:
             scheduler_type: 'cosine' or 'step' or 'plateau'
         """
         
-        # Initialize scheduler
         if scheduler_type == 'cosine':
             self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
                 self.optimizer,
@@ -241,22 +228,19 @@ class LFCCLCNNTrainer:
         best_eer = float('inf')
         
         for epoch in range(num_epochs):
-            # Get current learning rate
+
             current_lr = self.optimizer.param_groups[0]['lr']
             self.history['learning_rates'].append(current_lr)
             
             print(f"\nEpoch {epoch+1}/{num_epochs} | LR: {current_lr:.6f}")
             
-            # Train
             train_loss, train_acc = self.train_epoch(grad_clip=grad_clip)
             print(f"Train Loss: {train_loss:.6f} | Train Acc: {train_acc*100:.2f}%")
             
-            # Validate
             val_loss, val_acc, val_auc, val_eer = self.validate()
             print(f"Val Loss: {val_loss:.6f} | Val Acc: {val_acc*100:.2f}% | "
                   f"Val AUC: {val_auc:.6f} | Val EER: {val_eer:.4f}%")
             
-            # Update history
             self.history['train_loss'].append(train_loss)
             self.history['train_acc'].append(train_acc)
             self.history['val_loss'].append(val_loss)
@@ -264,7 +248,6 @@ class LFCCLCNNTrainer:
             self.history['val_auc'].append(val_auc)
             self.history['val_eer'].append(val_eer)
             
-            # Save checkpoints
             is_best = val_eer < best_eer
             if is_best:
                 best_eer = val_eer
@@ -273,12 +256,11 @@ class LFCCLCNNTrainer:
             self.save_checkpoint(epoch, val_eer, val_acc, save_path, is_best=is_best)
             self.save_metrics(save_path)
             
-            # Learning rate scheduling
             if self.scheduler is not None:
                 if scheduler_type == 'plateau':
-                    self.scheduler.step(val_eer)  # Step on metric for plateau
+                    self.scheduler.step(val_eer)
                 else:
-                    self.scheduler.step()  # Step on epoch for cosine/step
+                    self.scheduler.step()
             
         
         print(f"\n Training complete! Best EER: {best_eer:.4f}%")
@@ -287,7 +269,6 @@ class LFCCLCNNTrainer:
 
 
 def main():
-    # Configuration
     WAVEFAKE_ROOT = r"C:\Users\HazCodes\Documents\Datasets\generated_audio"
     LJSPEECH_ROOT = r"C:\Users\HazCodes\Documents\Datasets\generated_audio\LJSpeech-1.1\wavs"
     BATCH_SIZE = 64
@@ -317,7 +298,6 @@ def main():
         return
 
 
-    # Verify 80/20 split
     print("\n[DATA SPLIT VERIFICATION]")
     train_size = len(train_loader.dataset)
     test_size = len(test_loader.dataset)
@@ -341,7 +321,6 @@ def main():
     print(f"  Fake samples: {fake_count}")
     print(f"  Real samples: {real_count}")
     
-    # Weight = total / (num_classes * count)
     weight_fake = total / (2 * fake_count)
     weight_real = total / (2 * real_count)
     class_weights = torch.tensor([weight_fake, weight_real], dtype=torch.float32).to(device)
@@ -358,16 +337,13 @@ def main():
         n_filter=60
     )
     
-    # Initialize model
     model = LCNN(n_lfcc=60, num_classes=2)
     
-    # Count parameters
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"\nTotal parameters: {total_params:,}")
     print(f"Trainable parameters: {trainable_params:,}")
     
-    # Initialize trainer
     trainer = LFCCLCNNTrainer(
         model=model,
         lfcc_extractor=lfcc_extractor,
@@ -379,7 +355,6 @@ def main():
         class_weights=class_weights
     )
     
-    # Train with improved settings
     import os
     script_dir = os.path.dirname(os.path.abspath(__file__))
     save_path = os.path.join(script_dir, 'weights', 'best_lfcc_lcnn_wavefake.pt')

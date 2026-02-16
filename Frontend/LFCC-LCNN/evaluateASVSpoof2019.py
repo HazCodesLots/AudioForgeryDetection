@@ -62,12 +62,10 @@ class ASVspoof2019Dataset(Dataset):
             if waveform.ndim == 1:
                 waveform = waveform.unsqueeze(0)
             
-            # Peak normalization to [-1, 1] — matches WaveFake training preprocessing
             peak = torch.max(torch.abs(waveform))
             if peak > 0:
                 waveform = waveform / peak
             
-            # Pad or truncate
             if waveform.shape[1] < self.max_length:
                 waveform = F.pad(waveform, (0, self.max_length - waveform.shape[1]))
             else:
@@ -89,11 +87,9 @@ def evaluate_asvspoof(model_path, protocol_path, data_path, device='cuda'):
     device = torch.device(device if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}\n")
     
-    # Load checkpoint
     print(f"Loading model: {model_path}")
     checkpoint = torch.load(model_path, map_location=device)
     
-    # Initialize components
     lfcc_extractor = LFCCExtractor(n_lfcc=60, n_filter=60)
     lfcc_extractor.load_state_dict(checkpoint['lfcc_extractor_state_dict'])
     lfcc_extractor.to(device)
@@ -104,7 +100,6 @@ def evaluate_asvspoof(model_path, protocol_path, data_path, device='cuda'):
     model.to(device)
     model.eval()
     
-    # Dataset
     dataset = ASVspoof2019Dataset(protocol_path, data_path)
     loader = DataLoader(dataset, batch_size=64, shuffle=False, num_workers=4)
     
@@ -116,7 +111,6 @@ def evaluate_asvspoof(model_path, protocol_path, data_path, device='cuda'):
         for waveforms, labels in tqdm(loader):
             waveforms = waveforms.to(device)
             
-            # Extract features (squeeze added to handle batch-channel dim)
             lfcc = lfcc_extractor(waveforms.squeeze(1)) # (batch, n_lfcc, time)
             lfcc = lfcc.unsqueeze(1) # Add channel dim: (batch, 1, n_lfcc, time)
             
@@ -129,22 +123,17 @@ def evaluate_asvspoof(model_path, protocol_path, data_path, device='cuda'):
     all_labels = np.array(all_labels)
     all_scores = np.array(all_scores)
     
-    # Accuracy at 0.5 threshold
     all_preds = (all_scores > 0.5).astype(int)
     acc = accuracy_score(all_labels, all_preds)
-    
-    # AUC and EER
+
     auc_score = roc_auc_score(all_labels, all_scores)
     eer, _, _, _ = calculate_eer(all_labels, all_scores)
-    
-    print("\n" + "="*40)
+
     print("ASVSPOOF 2019 EVALUATION RESULTS")
-    print("="*40)
     print(f"Accuracy: {acc*100:.2f}%")
     print(f"AUC:      {auc_score:.4f}")
     print(f"EER:      {eer:.4f}%")
-    print("="*40)
-    
+
     if acc > 0.95 and eer < 5.0:
         print("\nWARNING: Model generalizes perfectly. This is extremely rare for cross-dataset.")
     elif acc < 0.60:
@@ -153,7 +142,6 @@ def evaluate_asvspoof(model_path, protocol_path, data_path, device='cuda'):
         print("\nRESULT: Partial generalizability observed.")
 
 if __name__ == "__main__":
-    # Settings for ASVspoof2019 LA Dev
     PROTOCOL = r"N:\ASVspoof2019\LA\ASVspoof2019_LA_cm_protocols\ASVspoof2019.LA.cm.dev.trl.txt"
     DATA_DIR = r"N:\ASVspoof2019\LA\ASVspoof2019_LA_dev\flac"
     
@@ -162,7 +150,6 @@ if __name__ == "__main__":
     MODEL_PATH = os.path.join(script_dir, 'weights', 'epoch_075.pt')
     
     if not os.path.exists(MODEL_PATH):
-        # Fallback to current folder if weights subfolder isn't there
         MODEL_PATH = os.path.join(script_dir, 'best_lfcc_lcnn_wavefake.pt')
 
     evaluate_asvspoof(MODEL_PATH, PROTOCOL, DATA_DIR)

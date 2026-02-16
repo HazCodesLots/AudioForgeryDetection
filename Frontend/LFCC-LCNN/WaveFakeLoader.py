@@ -19,14 +19,14 @@ class WaveFakeDatasetFixed(Dataset):
     def __init__(
         self,
         splits_json: str,
-        split_type: str = 'train',  # 'train' or 'test'
-        vocoders_to_include: list = None,  # None = all vocoders
+        split_type: str = 'train',
+        vocoders_to_include: list = None,
         include_real: bool = True,
         sample_rate: int = 16000,
         max_length: int = 64000,
         lfcc_extractor = None,
         noise_std: float = 0.001,
-        root_dir: str = None  # Optional override for the base path
+        root_dir: str = None
     ):
         self.sample_rate = sample_rate
         self.max_length = max_length
@@ -38,14 +38,11 @@ class WaveFakeDatasetFixed(Dataset):
         self.max_consecutive_errors = 50
         self.error_warned = False
         
-        # Load splits
         with open(splits_json, 'r') as f:
             self.splits = json.load(f)
-        
-        # Build sample list
+
         self.samples = []
         
-        # Add fake samples from specified vocoders
         vocoder_names = vocoders_to_include if vocoders_to_include else list(self.splits['vocoders'].keys())
         
         for vocoder_name in vocoder_names:
@@ -53,7 +50,6 @@ class WaveFakeDatasetFixed(Dataset):
                 print(f"Warning: {vocoder_name} not in splits")
                 continue
             
-            # 'all' combines both train and test for full-vocoder evaluation (e.g. LOVO)
             if split_type == 'all':
                 files = self.splits['vocoders'][vocoder_name]['train'] + self.splits['vocoders'][vocoder_name]['test']
             else:
@@ -67,7 +63,6 @@ class WaveFakeDatasetFixed(Dataset):
                     'vocoder': vocoder_name
                 })
         
-        # Add real samples
         if include_real and 'real' in self.splits:
             if split_type == 'all':
                 files = self.splits['real']['train'] + self.splits['real']['test']
@@ -95,30 +90,22 @@ class WaveFakeDatasetFixed(Dataset):
         audio_path = sample['path']
         label = sample['label']
         
-        # Load audio
         try:
-            # Handle root_dir override if provided
             if self.root_dir:
-                # Assuming the splits JSON contains absolute paths like C:\...\Datasets\generated_audio\...
-                # We often want to replace the part before 'generated_audio' or similar.
-                # A robust way is to use Path logic or simple string replacement if we know the structure.
-                # Here we'll try to find 'generated_audio' and replace everything before it.
                 if 'generated_audio' in audio_path:
                     relative_path = audio_path.split('generated_audio')[-1].lstrip('\\/')
                     audio_path = os.path.join(self.root_dir, relative_path)
             
             waveform, sr = sf.read(audio_path)
             
-            # Convert to mono if necessary
             if waveform.ndim > 1:
                 waveform = np.mean(waveform, axis=1)
             
-            # Resample if necessary
             if sr != self.sample_rate:
                 waveform = librosa.resample(waveform, orig_sr=sr, target_sr=self.sample_rate)
             
             waveform = torch.from_numpy(waveform).float().unsqueeze(0)
-            self.consecutive_errors = 0 # Reset on success
+            self.consecutive_errors = 0
             
         except Exception as e:
             self.consecutive_errors += 1
@@ -132,30 +119,22 @@ class WaveFakeDatasetFixed(Dataset):
                 
             waveform = torch.zeros(1, self.max_length)
         
-        # 1. Peak Normalization ([-1, 1])
         peak = torch.max(torch.abs(waveform))
         if peak > 0:
             waveform = waveform / peak
             
-        # 2. Add Minimal Gaussian Noise (if requested)
         if self.noise_std > 0:
             noise = torch.randn_like(waveform) * self.noise_std
             waveform = waveform + noise
 
-        # Pad/truncate
         if waveform.shape[1] < self.max_length:
             waveform = F.pad(waveform, (0, self.max_length - waveform.shape[1]))
         else:
             waveform = waveform[:, :self.max_length]
         
-        # Extract features
         if self.lfcc_extractor is not None:
-            # The extractor handles (batch, samples) internally or (batch, 1, samples)
-            # We unsqueeze(0) to simulate a batch of 1 if calling manually
             with torch.no_grad():
                 lfcc = self.lfcc_extractor(waveform)
-                # Extractor returns (batch, n_lfcc, time)
-                # We squeeze the surrogate batch dim
                 lfcc = lfcc.squeeze(0)
         else:
             lfcc = waveform
@@ -164,8 +143,8 @@ class WaveFakeDatasetFixed(Dataset):
 
 def create_loaders_from_splits(
     splits_json: str,
-    vocoders_train: list = None,  # None = all
-    vocoders_test: list = None,   # None = all
+    vocoders_train: list = None,
+    vocoders_test: list = None,
     batch_size: int = 64,
     num_workers: int = 4,
     noise_std: float = 0.001,
@@ -201,7 +180,7 @@ def create_loaders_from_splits(
         vocoders_to_include=vocoders_test,
         include_real=True,
         lfcc_extractor=lfcc_extractor,
-        noise_std=0.0,  # No noise during evaluation for clean, deterministic results
+        noise_std=0.0,
         root_dir=root_dir
     )
     

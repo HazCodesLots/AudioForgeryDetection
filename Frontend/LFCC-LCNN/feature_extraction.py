@@ -28,7 +28,6 @@ class LFCCExtractor(nn.Module):
         self.n_lfcc = n_lfcc
         self.n_filter = n_filter
         
-        # Register hamming window
         self.register_buffer('window', torch.hamming_window(win_length))
         
     def forward(self, waveform):
@@ -38,12 +37,9 @@ class LFCCExtractor(nn.Module):
         Returns:
             lfcc: (batch, n_lfcc, time_frames)
         """
-        # Handle (batch, 1, samples) input if necessary
         if waveform.ndim == 3:
             waveform = waveform.squeeze(1)
             
-        # Compute power spectrogram using native torch.stft
-        # STFT requires (batch, samples)
         stft = torch.stft(
             waveform,
             n_fft=self.n_fft,
@@ -57,21 +53,16 @@ class LFCCExtractor(nn.Module):
             return_complex=True
         )
         
-        # Get magnitude squared (power)
         spec = stft.abs().pow(2.0)  # (batch, freq_bins, time)
         
-        # Linear filter bank (uniform spacing unlike mel-scale)
         linear_filter = self._get_linear_filterbank(spec.size(1))
         linear_filter = linear_filter.to(spec.device)
         
-        # Apply filter bank
         spec = spec.transpose(1, 2)  # (batch, time, freq)
         linear_spec = torch.matmul(spec, linear_filter.T)  # (batch, time, n_filter)
         
-        # Log compression
         linear_spec = torch.log(linear_spec + 1e-6)
         
-        # DCT (Discrete Cosine Transform) to get cepstral coefficients
         lfcc = self._dct(linear_spec, norm='ortho')[:, :, :self.n_lfcc]
         
         return lfcc.transpose(1, 2)  # (batch, n_lfcc, time)
@@ -86,7 +77,6 @@ class LFCCExtractor(nn.Module):
             center = int(freq_bins[i + 1])
             right = int(freq_bins[i + 2])
             
-            # Triangular filter
             for j in range(left, center):
                 filters[i, j] = (j - left) / (center - left)
             for j in range(center, right):

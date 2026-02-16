@@ -83,14 +83,13 @@ def evaluate_lovo_on_asvspoof(protocol_path, data_path, device='cuda'):
     device = torch.device(device if torch.cuda.is_available() else 'cpu')
     script_dir = os.path.dirname(os.path.abspath(__file__))
     
-    # Load vocoder list from results JSON to ensure we matching the same order
     results_json = os.path.join(script_dir, 'weights', 'protocol', 'lovo_results.json')
     with open(results_json, 'r') as f:
         lovo_results = json.load(f)
     
     vocoders = sorted(lovo_results.keys(), key=lambda x: lovo_results[x]['fold'])
     
-    # Initialize Dataset
+
     dataset = ASVspoof2019Dataset(protocol_path, data_path)
     loader = DataLoader(dataset, batch_size=64, shuffle=False, num_workers=4, pin_memory=True)
     
@@ -108,8 +107,7 @@ def evaluate_lovo_on_asvspoof(protocol_path, data_path, device='cuda'):
             
         print(f"\n--- [FOLD {fold_id}/10] Model (Held-out: {held_out}) ---")
         checkpoint = torch.load(weight_path, map_location=device, weights_only=False)
-        
-        # Load components
+
         lfcc_extractor = LFCCExtractor(n_lfcc=60, n_filter=60).to(device)
         lfcc_extractor.load_state_dict(checkpoint['lfcc_extractor_state_dict'])
         lfcc_extractor.eval()
@@ -141,12 +139,9 @@ def evaluate_lovo_on_asvspoof(protocol_path, data_path, device='cuda'):
         cross_results[held_out] = {'eer': eer, 'acc': acc}
         print(f"  Result -> EER: {eer:.4f}%, Acc: {acc*100:.2f}%")
 
-    # Final Report
-    print("\n" + "="*75)
+
     print("ASVSPOOF 2019 CROSS-DATASET LOVO PERFORMANCE")
-    print("="*75)
     print(f"{'Held-out Vocoder (Model)':<40} {'EER (%)':<12} {'Acc (%)':<10}")
-    print("-" * 75)
     
     avg_eer = []
     for held_out in vocoders:
@@ -155,9 +150,20 @@ def evaluate_lovo_on_asvspoof(protocol_path, data_path, device='cuda'):
             print(f"{held_out[0:38]:<40} {r['eer']:>10.4f}%  {r['acc']*100:>8.2f}%")
             avg_eer.append(r['eer'])
             
-    print("-" * 75)
-    print(f"{'AVERAGE CROSS-DATASET EER':<40} {np.mean(avg_eer):>10.4f}%")
-    print("="*75)
+    final_avg = np.mean(avg_eer)
+    print(f"{'AVERAGE CROSS-DATASET EER':<40} {final_avg:>10.4f}%")
+
+    output_json = os.path.join(script_dir, 'weights', 'protocol', 'asvspoof_cross_lovo_results.json')
+    save_data = {
+        "summary": {
+            "average_eer": float(final_avg),
+            "num_folds": len(avg_eer)
+        },
+        "folds": cross_results
+    }
+    with open(output_json, 'w') as f:
+        json.dump(save_data, f, indent=4)
+    print(f"\n✓ Cross-dataset results saved to: {output_json}")
 
 if __name__ == "__main__":
     PROTOCOL = r"N:\ASVspoof2019\LA\ASVspoof2019_LA_cm_protocols\ASVspoof2019.LA.cm.dev.trl.txt"
