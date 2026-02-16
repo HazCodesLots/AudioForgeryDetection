@@ -1,0 +1,62 @@
+{
+    "common_voices_prompts_from_conformer_fastspeech2_pwg_ljspeech": {
+        "eer": 0.07983786770684703,
+        "accuracy": 0.9995401392721062,
+        "auc": 0.9999980966427309,
+        "fold": 1
+    },
+    "jsut_multi_band_melgan": {
+        "eer": 0.0,
+        "accuracy": 0.9986740331491712,
+        "auc": 1.0,
+        "fold": 2
+    },
+    "jsut_parallel_wavegan": {
+        "eer": 0.7399999999448651,
+        "accuracy": 0.983646408839779,
+        "auc": 0.9987617786259543,
+        "fold": 3
+    },
+    "ljspeech_full_band_melgan": {
+        "eer": 0.36641221374045435,
+        "accuracy": 0.9837404580152672,
+        "auc": 0.999742820931181,
+        "fold": 4
+    },
+    "ljspeech_hifiGAN": {
+        "eer": 1.2177231994819526,
+        "accuracy": 0.8825190839694657,
+        "auc": 0.9964750772099529,
+        "fold": 5
+    },
+    "ljspeech_melgan": {
+        "eer": 0.6583969465648829,
+        "accuracy": 0.967824427480916,
+        "auc": 0.999147028145213,
+        "fold": 6
+    },
+    "ljspeech_melgan_large": {
+        "eer": 0.02290076335880372,
+        "accuracy": 0.9988931297709923,
+        "auc": 0.9999998077035138,
+        "fold": 7
+    },
+    "ljspeech_multi_band_melgan": {
+        "eer": 0.9389312977302513,
+        "accuracy": 0.9705725190839695,
+        "auc": 0.9992638715692559,
+        "fold": 8
+    },
+    "ljspeech_parallel_wavegan": {
+        "eer": 0.5419847328406946,
+        "accuracy": 0.9838549618320611,
+        "auc": 0.999682451488841,
+        "fold": 9
+    },
+    "ljspeech_waveglow": {
+        "eer": 1.3352906635347719,
+        "accuracy": 0.8961068702290076,
+        "auc": 0.9974511654332497,
+        "fold": 10
+    }
+}
