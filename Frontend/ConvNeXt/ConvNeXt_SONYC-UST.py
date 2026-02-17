@@ -1,4 +1,5 @@
 import os
+import json
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -7,13 +8,12 @@ from torch.utils.data import Dataset, DataLoader
 import pandas as pd
 import numpy as np
 import librosa
-from sklearn.metrics import f1_score, precision_score, recall_score
+from sklearn.metrics import f1_score, precision_score, recall_score, average_precision_score, roc_auc_score
 from tqdm import tqdm
 import argparse
 import math
-# import torchaudio.transforms as T  # Removed due to environment issues
+from collections import defaultdict
 
-# --- Model Components from Notebook ---
 
 class DropPath(nn.Module):
     """Stochastic Depth for ConvNeXt blocks."""
@@ -237,7 +237,7 @@ class MLPClassifier(nn.Module):
         )
     
     def forward(self, x):
-        return self.classifier(x)  # Raw logits for BCEWithLogitsLoss
+        return self.classifier(x)
 
 class DeepFakeDetectionModel(nn.Module):
     def __init__(self,
@@ -256,7 +256,6 @@ class DeepFakeDetectionModel(nn.Module):
         logits = self.mlp(pooled_features)
         return logits
 
-# --- Enhanced Frontend and Data Layer ---
 
 class MelSpectrogramTransform:
     def __init__(self,
@@ -316,25 +315,6 @@ class EnhancedAudioFrontend(nn.Module):
 
 class SONYCUSTDataset(Dataset):
     def __init__(self, csv_path, audio_dir, split='train', frontend=None, limit_samples=None):
-        self.df = pd.read_csv(csv_path)
-        self.df = self.df[self.df['split'] == split].reset_index(drop=True)
-        
-        if limit_samples:
-            self.df = self.df.head(limit_samples)
-            
-        self.audio_dir = audio_dir
-        self.frontend = frontend
-        
-        # Build file index to handle subdirectories (audio-0, audio-1, etc.)
-        print(f"Building file index for {audio_dir}...")
-        self.file_map = {}
-        for root, _, files in os.walk(audio_dir):
-            for f in files:
-                if f.endswith('.wav'):
-                    self.file_map[f] = os.path.join(root, f)
-        print(f"Index built with {len(self.file_map)} files.")
-        
-        # SONYC-UST 23-class fine-grained presence columns
         self.label_cols = [
             '1-1_small-sounding-engine_presence', '1-2_medium-sounding-engine_presence', '1-3_large-sounding-engine_presence',
             '2-1_rock-drill_presence', '2-2_jackhammer_presence', '2-3_hoe-ram_presence', '2-4_pile-driver_presence',
@@ -346,6 +326,38 @@ class SONYCUSTDataset(Dataset):
             '8-1_dog-barking-whining_presence'
         ]
 
+        df_raw = pd.read_csv(csv_path)
+        df_split = df_raw[df_raw['split'] == split].copy()
+        
+        print(f"Aggregating labels for {split} split...")
+        self.df = df_split.groupby('audio_filename')[self.label_cols].max().reset_index()
+        
+        if limit_samples:
+            self.df = self.df.head(limit_samples)
+            
+        self.audio_dir = audio_dir
+        self.frontend = frontend
+        
+        print(f"Building file index for {audio_dir}...")
+        self.file_map = {}
+        for root, _, files in os.walk(audio_dir):
+            for f in files:
+                if f.endswith('.wav'):
+                    self.file_map[f] = os.path.join(root, f)
+        print(f"Index built with {len(self.file_map)} unique audio files.")
+
+    def get_pos_weights(self):
+        """Compute the positive weights for imbalance handling."""
+        labels = self.df[self.label_cols].values
+        binary_labels = np.where(labels > 0, 1.0, 0.0)
+        
+        pos_counts = binary_labels.sum(axis=0)
+        total_counts = len(binary_labels)
+        neg_counts = total_counts - pos_counts
+        
+        pos_weights = neg_counts / (pos_counts + 1e-6)
+        return torch.tensor(pos_weights, dtype=torch.float32)
+
     def __len__(self):
         return len(self.df)
 
@@ -354,7 +366,6 @@ class SONYCUSTDataset(Dataset):
         audio_name = row['audio_filename']
         
         if audio_name not in self.file_map:
-            # Fallback or error
             raise FileNotFoundError(f"Audio file {audio_name} not found in {self.audio_dir} or subdirectories.")
             
         audio_path = self.file_map[audio_name]
@@ -368,13 +379,11 @@ class SONYCUSTDataset(Dataset):
             mel = waveform
             
         labels = row[self.label_cols].values.astype(np.float32)
-        # SONYC-UST convention: 1 = present, 0 = absent, others might exist but typically binary for urban sound tagging
-        # We ensure it's 0 or 1 for multi-label.
         labels = np.where(labels > 0, 1.0, 0.0).astype(np.float32)
         
         return mel, torch.tensor(labels), audio_name
 
-def pad_truncate_collate(batch, max_length=626): # ~10s at sr=16000, hop=256 => 160000/256 = 625
+def pad_truncate_collate(batch, max_length=626):
     mels = []
     labels = []
     names = []
@@ -397,59 +406,274 @@ def pad_truncate_collate(batch, max_length=626): # ~10s at sr=16000, hop=256 => 
 
     return batch_mels, batch_labels, names
 
-# --- Training / Loop ---
-
-def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, device, num_epochs=20, save_path='best_sonyc_model.pth'):
-    best_val_f1 = 0.0
+def comprehensive_evaluation(predictions, targets, threshold=0.5):
+    """
+    Complete evaluation suite for multi-label classification.
+    predictions: probabilities (after sigmoid)
+    targets: binary labels
+    """
+    aps = []
+    for i in range(targets.shape[1]):
+        if targets[:, i].sum() > 0:
+            ap = average_precision_score(targets[:, i], predictions[:, i])
+            aps.append(ap)
+    mAP = np.mean(aps) if aps else 0.0
     
-    for epoch in range(num_epochs):
-        print(f"Epoch {epoch+1}/{num_epochs}")
+    auc_scores = []
+    for i in range(targets.shape[1]):
+        if len(np.unique(targets[:, i])) > 1:
+            auc = roc_auc_score(targets[:, i], predictions[:, i])
+            auc_scores.append(auc)
+    mean_auc = np.mean(auc_scores) if auc_scores else 0.0
+    
+    binary_preds = (predictions > threshold).astype(int)
+    f1_micro = f1_score(targets, binary_preds, average='micro', zero_division=0)
+    f1_macro = f1_score(targets, binary_preds, average='macro', zero_division=0)
+    
+    precision_samples = []
+    recall_samples = []
+    for i in range(len(targets)):
+        true_positives = np.sum(binary_preds[i] & targets[i].astype(int))
+        pred_positives = np.sum(binary_preds[i])
+        actual_positives = np.sum(targets[i])
+        
+        prec = true_positives / pred_positives if pred_positives > 0 else 0
+        rec = true_positives / actual_positives if actual_positives > 0 else 0
+        
+        precision_samples.append(prec)
+        recall_samples.append(rec)
+    
+    return {
+        'mAP': mAP,
+        'AUC': mean_auc,
+        'F1_micro': f1_micro,
+        'F1_macro': f1_macro,
+        'Precision_sample': np.mean(precision_samples),
+        'Recall_sample': np.mean(recall_samples)
+    }
+
+class EarlyStopping:
+    def __init__(self, patience=15, min_delta=0.001):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
+        
+    def __call__(self, val_map):
+        if self.best_score is None:
+            self.best_score = val_map
+        elif val_map < self.best_score + self.min_delta:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
+        else:
+            self.best_score = val_map
+            self.counter = 0
+
+    def get_state(self):
+        return {
+            'counter': self.counter,
+            'best_score': self.best_score,
+            'early_stop': self.early_stop
+        }
+    
+    def load_state(self, state):
+        self.counter = state.get('counter', 0)
+        self.best_score = state.get('best_score', None)
+        self.early_stop = state.get('early_stop', False)
+
+class TrainingMonitor:
+    """
+    Clean monitoring of gradients and weight updates.
+    Aggregates statistics per epoch.
+    """
+    def __init__(self):
+        self.history = {
+            'grad_norm_total': [],
+            'weight_update_ratio': []
+        }
+    
+    def compute_gradient_norm(self, model):
+        """Calculate total gradient norm."""
+        total_norm = 0.0
+        for param in model.parameters():
+            if param.grad is not None:
+                param_norm = param.grad.data.norm(2).item()
+                total_norm += param_norm ** 2
+        
+        return total_norm ** 0.5
+    
+    def compute_weight_update_ratio(self, model, optimizer):
+        """
+        Calculate weight_update / weight_magnitude ratio.
+        """
+        total_ratios = []
+        lr = optimizer.param_groups[0]['lr']
+        
+        for param in model.parameters():
+            if param.grad is not None:
+                weight_norm = param.data.norm(2).item()
+                update_norm = (lr * param.grad.data).norm(2).item()
+                if weight_norm > 1e-8:
+                    total_ratios.append(update_norm / weight_norm)
+        
+        return np.mean(total_ratios) if total_ratios else 0.0
+
+
+def train_model(model, train_loader, val_loader, device, num_epochs=100, save_path='results/best_sonyc_model.pth', resume=False, checkpoint_path='results/checkpoint_last.pth', pos_weight=None, metrics_path='results/metrics.json'):
+    """
+    Upgraded training pipeline for SONYC-UST with imbalance handling, continuous saving, and result organization.
+    """
+
+    results_dir = os.path.dirname(save_path)
+    if results_dir:
+        os.makedirs(results_dir, exist_ok=True)
+    
+    if pos_weight is not None:
+        pos_weight = pos_weight.to(device)
+    
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=3e-4,
+        weight_decay=1e-4
+    )
+    
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=num_epochs,
+        eta_min=1e-6
+    )
+    
+    early_stopping = EarlyStopping(patience=15)
+    monitor = TrainingMonitor()
+    
+    start_epoch = 0
+    best_map = 0.0
+    history = {
+        'train_loss': [], 
+        'val_loss': [], 
+        'val_mAP': [],
+        'grad_norm': [],
+        'update_ratio': []
+    }
+    
+    if resume and os.path.exists(checkpoint_path):
+        print(f"Resuming training from checkpoint: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        start_epoch = checkpoint['epoch'] + 1
+        best_map = checkpoint['best_map']
+        history = checkpoint['history']
+        early_stopping.load_state(checkpoint['early_stopping_state'])
+        print(f"Resumed from epoch {start_epoch}. Previous best mAP: {best_map:.4f}")
+
+    for epoch in range(start_epoch, num_epochs):
+        print(f"\nEpoch {epoch+1}/{num_epochs}")
+        
         model.train()
         running_loss = 0.0
-        
         train_bar = tqdm(train_loader, desc="Training")
+        
+        epoch_grad_norms = []
+        epoch_update_ratios = []
+
         for mels, labels, _ in train_bar:
-            mels, labels = mels.to(device), labels.to(device)
+            mels, labels = mels.to(device), labels.to(device).float()
             
             optimizer.zero_grad()
             outputs = model(mels)
             loss = criterion(outputs, labels)
             loss.backward()
-            optimizer.step()
+
+            epoch_grad_norms.append(monitor.compute_gradient_norm(model))
+            epoch_update_ratios.append(monitor.compute_weight_update_ratio(model, optimizer))
+
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             
+            optimizer.step()
             running_loss += loss.item()
             train_bar.set_postfix(loss=loss.item())
 
+        avg_train_loss = running_loss / len(train_loader)
+        avg_grad_norm = np.mean(epoch_grad_norms)
+        avg_update_ratio = np.mean(epoch_update_ratios)
+
         model.eval()
         val_loss = 0.0
-        all_preds = []
+        all_logits = []
         all_targets = []
         
         with torch.no_grad():
             for mels, labels, _ in tqdm(val_loader, desc="Validation"):
-                mels, labels = mels.to(device), labels.to(device)
+                mels, labels = mels.to(device), labels.to(device).float()
                 outputs = model(mels)
                 loss = criterion(outputs, labels)
                 val_loss += loss.item()
                 
-                preds = (torch.sigmoid(outputs) > 0.5).float()
-                all_preds.append(preds.cpu().numpy())
+                all_logits.append(outputs.cpu().numpy())
                 all_targets.append(labels.cpu().numpy())
 
-        all_preds = np.concatenate(all_preds, axis=0)
-        all_targets = np.concatenate(all_targets, axis=0)
+        logits = np.concatenate(all_logits, axis=0)
+        targets = np.concatenate(all_targets, axis=0)
         
-        # Macro F1 for urban sound tagging
-        f1 = f1_score(all_targets, all_preds, average='macro', zero_division=0)
-        print(f"Epoch {epoch+1} - Val Loss: {val_loss/len(val_loader):.4f}, Macro F1: {f1:.4f}")
+        predictions = 1 / (1 + np.exp(-logits))
         
-        if scheduler:
-            scheduler.step()
+        metrics = comprehensive_evaluation(predictions, targets)
+        avg_val_loss = val_loss / len(val_loader)
+        val_map = metrics['mAP']
+        
+        history['train_loss'].append(avg_train_loss)
+        history['val_loss'].append(avg_val_loss)
+        history['val_mAP'].append(val_map)
+        history['grad_norm'].append(float(avg_grad_norm))
+        history['update_ratio'].append(float(avg_update_ratio))
+        
+        print(f"Epoch {epoch+1} Results:")
+        print(f"  Train Loss:   {avg_train_loss:.4f}")
+        print(f"  Val Loss:     {avg_val_loss:.4f}")
+        print(f"  mAP:          {val_map:.4f} (Primary)")
+        print(f"  AUC-ROC:      {metrics['AUC']:.4f}")
+        print(f"  Macro F1:     {metrics['F1_macro']:.4f}")
+        print(f"  Grad Norm:    {avg_grad_norm:.4f}")
+        print(f"  Update Ratio: {avg_update_ratio:.2e}")
+        print(f"  LR:           {optimizer.param_groups[0]['lr']:.6f}")
 
-        if f1 > best_val_f1:
-            best_val_f1 = f1
+        if val_map > best_map:
+            best_map = val_map
             torch.save(model.state_dict(), save_path)
-            print(f"Saved best model with F1: {best_val_f1:.4f}")
+            print(f"  New best mAP: {best_map:.4f}. Model saved.")
+        
+        scheduler.step()
+        
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'best_map': best_map,
+            'history': history,
+            'early_stopping_state': early_stopping.get_state()
+        }
+        torch.save(checkpoint, checkpoint_path)
+        
+        epoch_model_path = os.path.join(os.path.dirname(save_path), f"model_epoch_{epoch+1}.pth")
+        torch.save(model.state_dict(), epoch_model_path)
+        
+        if metrics_path:
+            with open(metrics_path, 'w') as f:
+                json.dump(history, f, indent=4)
+        
+        early_stopping(val_map)
+        if early_stopping.early_stop:
+            print(f"\nEarly stopping triggered at epoch {epoch+1}")
+            break
+            
+    return history
 
 def main():
     parser = argparse.ArgumentParser()
@@ -458,13 +682,16 @@ def main():
     parser.add_argument('--batch_size', type=int, default=16)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--limit_samples', type=int, default=None)
+    parser.add_argument('--metrics_path', type=str, default='results/metrics.json', help='Path to save training metrics')
+    parser.add_argument('--resume', action='store_true', help='Resume training from last checkpoint')
+    parser.add_argument('--checkpoint_path', type=str, default='results/checkpoint_last.pth', help='Path to the last checkpoint')
+    parser.add_argument('--save_path', type=str, default='results/best_sonyc_model.pth', help='Path to save best model weights')
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    # Audio Directory - check if it's top level or 'audio' subfolder
-    audio_dir = args.dataset_path # SONYC-UST usually unpacks to many wavs. Needs a path.
+    audio_dir = args.dataset_path
     csv_path = os.path.join(args.dataset_path, 'annotations.csv')
 
     frontend = EnhancedAudioFrontend(n_mels=128)
@@ -475,19 +702,21 @@ def main():
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=pad_truncate_collate)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=pad_truncate_collate)
 
-    # Model Params (adapted for 128 mels and 8 classes)
+    pos_weight = train_dataset.get_pos_weights()
+    print(f"Positive weights for loss: {pos_weight.numpy()}")
+
     convnext_params = {
         'input_channels': 1,
-        'depths': [2, 2, 4, 2],
-        'dims': [48, 96, 192, 384],
+        'depths': [2, 2, 6, 2],
+        'dims': [64, 128, 256, 512],
         'drop_path_rate': 0.2,
         'layer_scale_init_value': 1e-6
     }
     attention_params = {
-        'input_dim': 384,       # From new lightweight ConvNeXt
-        'attention_dim': 256,   # Down from 512 (lighter)
-        'num_heads': 4,         # Down from 8 (still multi-head!)
-        'dropout_rate': 0.15    # Up from 0.1 (more regularization)
+        'input_dim': 512,
+        'attention_dim': 256,
+        'num_heads': 4,
+        'dropout_rate': 0.15
     }
     mlp_params = {
         'input_dim': 256,
@@ -498,13 +727,19 @@ def main():
     model = DeepFakeDetectionModel(convnext_params, attention_params, mlp_params)
     model.to(device)
 
-    criterion = nn.BCEWithLogitsLoss()
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr)
+    history = train_model(model, train_loader, val_loader, device, 
+                          num_epochs=args.epochs, resume=args.resume, 
+                          checkpoint_path=args.checkpoint_path,
+                          save_path=args.save_path,
+                          pos_weight=pos_weight,
+                          metrics_path=args.metrics_path)
     
-    # Simple scheduler
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-
-    train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, device, num_epochs=args.epochs)
+    with open(args.metrics_path, 'w') as f:
+        json.dump(history, f, indent=4)
+        
+    print(f"\nTraining Complete. Metrics saved to {args.metrics_path}")
+    best_mAP = max(history['val_mAP']) if history['val_mAP'] else 0.0
+    print(f"Best mAP achieved: {best_mAP:.4f}")
 
 if __name__ == '__main__':
     main()
