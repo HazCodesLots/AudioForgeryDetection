@@ -142,14 +142,12 @@ class FactorizedAttentionPooling(nn.Module):
     """
     def __init__(self, input_dim=512, attention_dim=256, num_heads=4, dropout_rate=0.15):
         super().__init__()
-        # Stage 1: pool over frequency axis
         self.freq_attn = nn.MultiheadAttention(
             input_dim, num_heads, batch_first=True, dropout=dropout_rate
         )
         self.freq_norm = nn.LayerNorm(input_dim)
         self.freq_dropout = nn.Dropout(dropout_rate)
 
-        # Stage 2: pool over time axis
         self.time_attn = nn.MultiheadAttention(
             input_dim, num_heads, batch_first=True, dropout=dropout_rate
         )
@@ -161,22 +159,19 @@ class FactorizedAttentionPooling(nn.Module):
     def forward(self, x):
         B, C, F, T = x.shape
 
-        # --- Stage 1: Frequency pooling ---
-        # Treat each time step as a sequence of F frequency tokens
         x_freq = x.permute(0, 3, 2, 1).contiguous().view(B * T, F, C)
         attn_out, _ = self.freq_attn(x_freq, x_freq, x_freq)
         x_freq = self.freq_norm(attn_out + x_freq)
         x_freq = self.freq_dropout(x_freq)
-        x_freq = x_freq.mean(dim=1)          # (B*T, C) — pooled over freq
-        x_freq = x_freq.view(B, T, C)        # (B, T, C)
+        x_freq = x_freq.mean(dim=1)
+        x_freq = x_freq.view(B, T, C)
 
-        # --- Stage 2: Time pooling ---
         attn_out, _ = self.time_attn(x_freq, x_freq, x_freq)
         x_time = self.time_norm(attn_out + x_freq)
         x_time = self.time_dropout(x_time)
-        pooled = x_time.mean(dim=1)           # (B, C) — pooled over time
+        pooled = x_time.mean(dim=1)
 
-        return self.out_proj(pooled)          # (B, attention_dim)
+        return self.out_proj(pooled)
 
 
 class SpecAugment(nn.Module):
@@ -187,25 +182,20 @@ class SpecAugment(nn.Module):
         self.freq_mask_param = freq_mask_param
 
     def forward(self, x):
-        # x shape: (B, C, F, T) or (C, F, T)
         if x.ndim == 3:
             C, F_dim, T_dim = x.shape
-            # Frequency masking
             f = int(np.random.uniform(0, self.freq_mask_param))
             f0 = int(np.random.uniform(0, F_dim - f))
             x[:, f0:f0+f, :] = 0
-            # Time masking
             t = int(np.random.uniform(0, self.time_mask_param))
             t0 = int(np.random.uniform(0, T_dim - t))
             x[:, :, t0:t0+t] = 0
         else:
             B, C, F_dim, T_dim = x.shape
             for i in range(B):
-                # Frequency masking
                 f = int(np.random.uniform(0, self.freq_mask_param))
                 f0 = int(np.random.uniform(0, F_dim - f))
                 x[i, :, f0:f0+f, :] = 0
-                # Time masking
                 t = int(np.random.uniform(0, self.time_mask_param))
                 t0 = int(np.random.uniform(0, T_dim - t))
                 x[i, :, :, t0:t0+t] = 0
@@ -318,14 +308,9 @@ class SONYCUSTDataset(Dataset):
         df_raw = pd.read_csv(csv_path)
         df_split = df_raw[df_raw['split'] == split].copy()
         
-        # 1. Sanitize Data
-        # Replace -1 (unsure/hidden) with 0
         df_split[self.label_cols] = df_split[self.label_cols].replace(-1, 0)
         
-        # 2. Filter Spam Annotations (e.g. all 1s)
-        # It's impossible to have all 23 classes active. Cap at 10 to be safe.
         row_sums = df_split[self.label_cols].sum(axis=1)
-        # Keep only rows with <= 10 positives
         df_split = df_split[row_sums <= 10]
         
         print(f"Aggregating labels for {split} split (Sanitized)...")
@@ -356,7 +341,6 @@ class SONYCUSTDataset(Dataset):
         
         pos_weights = neg_counts / (pos_counts + 1e-6)
         
-        # Cap weights — raised to 20.0 for rare classes (prev < 1.5%)
         pos_weights = np.clip(pos_weights, a_min=None, a_max=20.0)
         
         return torch.tensor(pos_weights, dtype=torch.float32)
@@ -373,7 +357,7 @@ class SONYCUSTDataset(Dataset):
             
         audio_path = self.file_map[audio_name]
         
-        waveform, sr = librosa.load(audio_path, sr=16000, duration=10.0) # 10s audio
+        waveform, sr = librosa.load(audio_path, sr=16000, duration=10.0)
         waveform = torch.from_numpy(waveform).float()
         
         if self.frontend:
@@ -397,18 +381,15 @@ class FocalLoss(nn.Module):
         self.register_buffer('pos_weight', pos_weight)
 
     def forward(self, logits, targets):
-        # BCE component
         bce = F.binary_cross_entropy_with_logits(
             logits, targets, reduction='none'
         )
-        # Probability for focal modulation
         p = torch.sigmoid(logits)
         p_t = targets * p + (1 - targets) * (1 - p)
         focal_weight = (1 - p_t) ** self.gamma
 
         loss = focal_weight * bce
 
-        # Apply pos_weight: scale loss for positive samples
         if self.pos_weight is not None:
             weight = targets * self.pos_weight + (1 - targets)
             loss = loss * weight
@@ -581,14 +562,13 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100, save_pa
 
     optimizer = optim.AdamW(
         model.parameters(),
-        lr=warmup_start_lr,       # start low, warmup will ramp it
+        lr=warmup_start_lr,
         weight_decay=1e-4
     )
 
     def lr_lambda(epoch):
         if epoch < warmup_epochs:
             return (base_lr / warmup_start_lr) * ((epoch + 1) / warmup_epochs)
-        # cosine decay after warmup
         progress = (epoch - warmup_epochs) / max(1, num_epochs - warmup_epochs)
         return (base_lr / warmup_start_lr) * (0.5 * (1.0 + math.cos(math.pi * progress)))
 
@@ -641,7 +621,6 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100, save_pa
             loss = criterion(outputs, labels)
             loss.backward()
 
-            # Monitoring (before clipping and step)
             epoch_grad_norms.append(monitor.compute_gradient_norm(model))
             epoch_update_ratios.append(monitor.compute_weight_update_ratio(model, optimizer))
             g_min, g_max = monitor.compute_grad_min_max(model)
@@ -676,21 +655,16 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100, save_pa
                 all_logits.append(outputs.cpu().numpy())
                 all_targets.append(labels.cpu().numpy())
 
-        # Prediction Spot Check
         print("\n--- Prediction Spot Check ---")
         try:
-            # Get first batch
             mels_check, labels_check, _ = next(iter(val_loader))
             mels_check = mels_check.to(device)
             outputs_check = model(mels_check)
             probs_check = torch.sigmoid(outputs_check)
-            
-            # Check first 3 samples
+
             for i in range(min(3, len(probs_check))):
                 print(f"Sample {i}:")
-                # print(f"  Labels:     {labels_check[i].numpy()}")
                 print(f"  Label sum:  {labels_check[i].sum().item()}")
-                # print(f"  Probs:      {probs_check[i].cpu().detach().numpy()}")
                 print(f"  Prob max:   {probs_check[i].max().item():.4f}")
             
             print(f"=== Overall Batch Stats ===")
@@ -772,12 +746,10 @@ def main():
     parser.add_argument('--batch_size', type=int, default=16)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--limit_samples', type=int, default=None)
-    # Results folder path relative to script
     script_dir = os.path.dirname(os.path.abspath(__file__))
     default_results_dir = os.path.join(script_dir, 'results')
     os.makedirs(default_results_dir, exist_ok=True)
 
-    # Auto-increment run counter to prevent overwrites
     existing_runs = [f for f in os.listdir(default_results_dir) if f.startswith('metrics_run') and f.endswith('.json')]
     run_nums = [int(f.replace('metrics_run', '').replace('.json', '')) for f in existing_runs if f.replace('metrics_run', '').replace('.json', '').isdigit()]
     run_id = max(run_nums) + 1 if run_nums else 1
@@ -802,8 +774,6 @@ def main():
 
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=pad_truncate_collate)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=pad_truncate_collate)
-
-    # Removed pos_weight based on user request to fix gradient issues
 
     convnext_params = {
         'input_channels': 1,

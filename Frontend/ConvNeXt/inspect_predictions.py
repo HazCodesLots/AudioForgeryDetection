@@ -7,10 +7,8 @@ import pandas as pd
 from torch.utils.data import DataLoader
 import importlib.util
 
-# Add current directory to path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-# Import logic from main script
 def import_module_by_path(module_name, file_path):
     spec = importlib.util.spec_from_file_location(module_name, file_path)
     module = importlib.util.module_from_spec(spec)
@@ -72,7 +70,6 @@ def inspect(dataset_path):
     model.to(device)
     model.eval()
 
-    # User's Inspection Loop
     print("\n--- Model Prediction Inspection ---")
     with torch.no_grad():
         for inputs, labels, _ in val_loader:
@@ -80,12 +77,9 @@ def inspect(dataset_path):
             outputs = model(inputs)
             probs = torch.sigmoid(outputs)
             
-            # Check first 3 samples
             for i in range(min(3, len(probs))):
                 print(f"\nSample {i}:")
-                # print(f"  Labels:     {labels[i].numpy()}")
                 print(f"  Label sum:  {labels[i].sum().item()}")
-                # print(f"  Probs:      {probs[i].cpu().numpy()}")
                 print(f"  Prob max:   {probs[i].max().item():.4f}")
             
             print(f"\n=== Overall Batch Stats ===")

@@ -25,7 +25,6 @@ from sklearn.metrics import (
 from tqdm import tqdm
 import importlib.util
 
-# --- Import model components from main script ---
 def import_module_by_path(module_name, file_path):
     spec = importlib.util.spec_from_file_location(module_name, file_path)
     module = importlib.util.module_from_spec(spec)
@@ -41,8 +40,6 @@ EnhancedAudioFrontend = model_script.EnhancedAudioFrontend
 SONYCUSTDataset = model_script.SONYCUSTDataset
 pad_truncate_collate = model_script.pad_truncate_collate
 
-# --- SONYC-UST Taxonomy ---
-# Fine-grained labels (23 classes) grouped into coarse categories (8 classes)
 FINE_LABELS = [
     '1-1_small-sounding-engine',
     '1-2_medium-sounding-engine',
@@ -92,7 +89,6 @@ FINE_TO_COARSE = {
     22: 7                       # 8-1 -> dog
 }
 
-# Which fine indices belong to each coarse class
 COARSE_TO_FINE = {}
 for fine_idx, coarse_idx in FINE_TO_COARSE.items():
     if coarse_idx not in COARSE_TO_FINE:
@@ -116,7 +112,6 @@ def compute_auprc(targets, predictions, label_names, level_name="Fine"):
     """
     n_classes = targets.shape[1]
 
-    # --- Per-class AUPRC ---
     per_class = {}
     valid_aps = []
     for i in range(n_classes):
@@ -137,15 +132,12 @@ def compute_auprc(targets, predictions, label_names, level_name="Fine"):
                 'note': 'skipped (no positive samples)'
             }
 
-    # --- Macro-AUPRC (official primary metric) ---
     macro_auprc = float(np.mean(valid_aps)) if valid_aps else 0.0
 
-    # --- Micro-AUPRC ---
     micro_auprc = float(average_precision_score(
         targets.ravel(), predictions.ravel()
     ))
 
-    # --- AUC-ROC ---
     auc_scores = []
     for i in range(n_classes):
         if len(np.unique(targets[:, i])) > 1:
@@ -169,14 +161,12 @@ def run_evaluation(dataset_path, weights_path, split='validate', batch_size=16):
     print(f"Weights: {weights_path}")
     print(f"Split: {split}")
 
-    # --- Setup Data ---
     csv_path = os.path.join(dataset_path, 'annotations.csv')
     frontend = EnhancedAudioFrontend(n_mels=128)
     dataset = SONYCUSTDataset(csv_path, dataset_path, split=split, frontend=frontend)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False,
                         collate_fn=pad_truncate_collate, num_workers=0)
 
-    # --- Setup Model ---
     convnext_params = {
         'input_channels': 1, 'depths': [2, 2, 6, 2],
         'dims': [64, 128, 256, 512], 'drop_path_rate': 0.2,
@@ -191,7 +181,6 @@ def run_evaluation(dataset_path, weights_path, split='validate', batch_size=16):
     model.to(device)
     model.eval()
 
-    # --- Inference ---
     all_logits = []
     all_targets = []
 
@@ -205,14 +194,11 @@ def run_evaluation(dataset_path, weights_path, split='validate', batch_size=16):
 
     logits = np.concatenate(all_logits, axis=0)
     targets = np.concatenate(all_targets, axis=0)
-    predictions = 1 / (1 + np.exp(-logits))  # sigmoid
+    predictions = 1 / (1 + np.exp(-logits))
 
     print(f"Evaluated {len(targets)} samples")
 
-    # --- Fine-level evaluation (23 classes) ---
-    print("\n" + "=" * 60)
     print("FINE-LEVEL EVALUATION (23 classes)")
-    print("=" * 60)
     fine_results = compute_auprc(targets, predictions, FINE_LABELS, "Fine (23 classes)")
     print(f"  Macro-AUPRC:  {fine_results['macro_AUPRC']:.4f}  (PRIMARY METRIC)")
     print(f"  Micro-AUPRC:  {fine_results['micro_AUPRC']:.4f}")
@@ -226,13 +212,10 @@ def run_evaluation(dataset_path, weights_path, split='validate', batch_size=16):
         else:
             print(f"    {name:45s}  SKIPPED (no positives)")
 
-    # --- Coarse-level evaluation (8 classes) ---
     coarse_targets = aggregate_to_coarse(targets)
     coarse_preds = aggregate_to_coarse(predictions)
 
-    print("\n" + "=" * 60)
     print("COARSE-LEVEL EVALUATION (8 classes)")
-    print("=" * 60)
     coarse_results = compute_auprc(coarse_targets, coarse_preds, COARSE_LABELS, "Coarse (8 classes)")
     print(f"  Macro-AUPRC:  {coarse_results['macro_AUPRC']:.4f}")
     print(f"  Micro-AUPRC:  {coarse_results['micro_AUPRC']:.4f}")
@@ -246,18 +229,14 @@ def run_evaluation(dataset_path, weights_path, split='validate', batch_size=16):
         else:
             print(f"    {name:30s}  SKIPPED (no positives)")
 
-    # --- Additional metrics ---
     binary_preds = (predictions > 0.5).astype(int)
     f1_macro = f1_score(targets, binary_preds, average='macro', zero_division=0)
     f1_micro = f1_score(targets, binary_preds, average='micro', zero_division=0)
 
-    print("\n" + "=" * 60)
     print("ADDITIONAL METRICS (threshold=0.5)")
-    print("=" * 60)
     print(f"  Macro F1: {f1_macro:.4f}")
     print(f"  Micro F1: {f1_micro:.4f}")
 
-    # --- Save results ---
     results = {
         'model_weights': weights_path,
         'split': split,
