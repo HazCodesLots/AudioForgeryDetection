@@ -134,60 +134,49 @@ class ConvNeXt2D(nn.Module):
                 x = self.downsamples[i][1](x)
         return x
 
-class SelfAttentivePooling(nn.Module):
-    def __init__(self, input_dim=384, attention_dim=256, num_heads=4, dropout_rate=0.15):
+class FactorizedAttentionPooling(nn.Module):
+    """
+    Two-stage attention pooling that preserves spectral-temporal structure.
+    Stage 1: Pool over frequency axis (per time step)
+    Stage 2: Pool over time axis
+    """
+    def __init__(self, input_dim=512, attention_dim=256, num_heads=4, dropout_rate=0.15):
         super().__init__()
-        self.attention_dim = attention_dim
-        self.num_heads = num_heads
-        self.head_dim = attention_dim // num_heads  # 64 per head
-        self.dropout_rate = dropout_rate
+        # Stage 1: pool over frequency axis
+        self.freq_attn = nn.MultiheadAttention(
+            input_dim, num_heads, batch_first=True, dropout=dropout_rate
+        )
+        self.freq_norm = nn.LayerNorm(input_dim)
+        self.freq_dropout = nn.Dropout(dropout_rate)
 
-        # Q, K, V projections
-        self.query = nn.Linear(input_dim, attention_dim)
-        self.key = nn.Linear(input_dim, attention_dim)
-        self.value = nn.Linear(input_dim, attention_dim)
+        # Stage 2: pool over time axis
+        self.time_attn = nn.MultiheadAttention(
+            input_dim, num_heads, batch_first=True, dropout=dropout_rate
+        )
+        self.time_norm = nn.LayerNorm(input_dim)
+        self.time_dropout = nn.Dropout(dropout_rate)
 
-        # Dropouts
-        self.attn_dropout = nn.Dropout(dropout_rate)
-        self.out_proj = nn.Linear(attention_dim, attention_dim)
-        self.out_dropout = nn.Dropout(dropout_rate)
-        
-        # Residual connection
-        self.layer_norm = nn.LayerNorm(attention_dim)
-        self.input_proj = nn.Linear(input_dim, attention_dim)
+        self.out_proj = nn.Linear(input_dim, attention_dim)
 
     def forward(self, x):
-        batch_size, channels, freq, time = x.shape
-        # Flatten freq×time into sequence
-        x_reshaped = x.permute(0, 2, 3, 1).contiguous().view(batch_size, freq * time, channels)
+        B, C, F, T = x.shape
 
-        Q = self.query(x_reshaped)
-        K = self.key(x_reshaped)
-        V = self.value(x_reshaped)
+        # --- Stage 1: Frequency pooling ---
+        # Treat each time step as a sequence of F frequency tokens
+        x_freq = x.permute(0, 3, 2, 1).contiguous().view(B * T, F, C)
+        attn_out, _ = self.freq_attn(x_freq, x_freq, x_freq)
+        x_freq = self.freq_norm(attn_out + x_freq)
+        x_freq = self.freq_dropout(x_freq)
+        x_freq = x_freq.mean(dim=1)          # (B*T, C) — pooled over freq
+        x_freq = x_freq.view(B, T, C)        # (B, T, C)
 
-        # Multi-head split
-        Q = Q.view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
-        K = K.view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
-        V = V.view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        # --- Stage 2: Time pooling ---
+        attn_out, _ = self.time_attn(x_freq, x_freq, x_freq)
+        x_time = self.time_norm(attn_out + x_freq)
+        x_time = self.time_dropout(x_time)
+        pooled = x_time.mean(dim=1)           # (B, C) — pooled over time
 
-        # Scaled dot-product attention
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / (self.head_dim ** 0.5)
-        attention_weights = F.softmax(scores, dim=-1)
-        attention_weights = self.attn_dropout(attention_weights)
-
-        attended = torch.matmul(attention_weights, V)
-        attended = attended.transpose(1, 2).contiguous().view(batch_size, -1, self.attention_dim)
-
-        # Output projection + residual
-        out = self.out_proj(attended)
-        out = self.out_dropout(out)
-        
-        x_proj = self.input_proj(x_reshaped)
-        out = self.layer_norm(out + x_proj)
-
-        # Final pooling across all positions
-        pooled = out.mean(dim=1)  # (B, attention_dim)
-        return pooled
+        return self.out_proj(pooled)          # (B, attention_dim)
 
 
 class SpecAugment(nn.Module):
@@ -247,7 +236,7 @@ class DeepFakeDetectionModel(nn.Module):
         super().__init__()
 
         self.convnext = ConvNeXt2D(**convnext_params)
-        self.att_pool = SelfAttentivePooling(**attention_params)
+        self.att_pool = FactorizedAttentionPooling(**attention_params)
         self.mlp = MLPClassifier(**mlp_params)
 
     def forward(self, x):
@@ -329,7 +318,17 @@ class SONYCUSTDataset(Dataset):
         df_raw = pd.read_csv(csv_path)
         df_split = df_raw[df_raw['split'] == split].copy()
         
-        print(f"Aggregating labels for {split} split...")
+        # 1. Sanitize Data
+        # Replace -1 (unsure/hidden) with 0
+        df_split[self.label_cols] = df_split[self.label_cols].replace(-1, 0)
+        
+        # 2. Filter Spam Annotations (e.g. all 1s)
+        # It's impossible to have all 23 classes active. Cap at 10 to be safe.
+        row_sums = df_split[self.label_cols].sum(axis=1)
+        # Keep only rows with <= 10 positives
+        df_split = df_split[row_sums <= 10]
+        
+        print(f"Aggregating labels for {split} split (Sanitized)...")
         self.df = df_split.groupby('audio_filename')[self.label_cols].max().reset_index()
         
         if limit_samples:
@@ -356,6 +355,10 @@ class SONYCUSTDataset(Dataset):
         neg_counts = total_counts - pos_counts
         
         pos_weights = neg_counts / (pos_counts + 1e-6)
+        
+        # Cap weights — raised to 20.0 for rare classes (prev < 1.5%)
+        pos_weights = np.clip(pos_weights, a_min=None, a_max=20.0)
+        
         return torch.tensor(pos_weights, dtype=torch.float32)
 
     def __len__(self):
@@ -382,6 +385,35 @@ class SONYCUSTDataset(Dataset):
         labels = np.where(labels > 0, 1.0, 0.0).astype(np.float32)
         
         return mel, torch.tensor(labels), audio_name
+
+class FocalLoss(nn.Module):
+    """
+    Focal Loss for multi-label classification.
+    Down-weights easy negatives (gamma), up-weights rare positives (pos_weight).
+    """
+    def __init__(self, gamma=2.0, pos_weight=None):
+        super().__init__()
+        self.gamma = gamma
+        self.register_buffer('pos_weight', pos_weight)
+
+    def forward(self, logits, targets):
+        # BCE component
+        bce = F.binary_cross_entropy_with_logits(
+            logits, targets, reduction='none'
+        )
+        # Probability for focal modulation
+        p = torch.sigmoid(logits)
+        p_t = targets * p + (1 - targets) * (1 - p)
+        focal_weight = (1 - p_t) ** self.gamma
+
+        loss = focal_weight * bce
+
+        # Apply pos_weight: scale loss for positive samples
+        if self.pos_weight is not None:
+            weight = targets * self.pos_weight + (1 - targets)
+            loss = loss * weight
+
+        return loss.mean()
 
 def pad_truncate_collate(batch, max_length=626):
     mels = []
@@ -491,7 +523,9 @@ class TrainingMonitor:
     def __init__(self):
         self.history = {
             'grad_norm_total': [],
-            'weight_update_ratio': []
+            'weight_update_ratio': [],
+            'grad_min': [],
+            'grad_max': []
         }
     
     def compute_gradient_norm(self, model):
@@ -520,8 +554,16 @@ class TrainingMonitor:
         
         return np.mean(total_ratios) if total_ratios else 0.0
 
+    def compute_grad_min_max(self, model):
+        """Calculate min and max gradient values across all parameters."""
+        grads = [p.grad.data.view(-1) for p in model.parameters() if p.grad is not None]
+        if not grads:
+            return 0.0, 0.0
+        all_grads = torch.cat(grads)
+        return all_grads.min().item(), all_grads.max().item()
 
-def train_model(model, train_loader, val_loader, device, num_epochs=100, save_path='results/best_sonyc_model.pth', resume=False, checkpoint_path='results/checkpoint_last.pth', pos_weight=None, metrics_path='results/metrics.json'):
+
+def train_model(model, train_loader, val_loader, device, num_epochs=100, save_path='results/best_sonyc_model.pth', resume=False, checkpoint_path='results/checkpoint_last.pth', metrics_path='results/metrics.json'):
     """
     Upgraded training pipeline for SONYC-UST with imbalance handling, continuous saving, and result organization.
     """
@@ -530,22 +572,27 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100, save_pa
     if results_dir:
         os.makedirs(results_dir, exist_ok=True)
     
-    if pos_weight is not None:
-        pos_weight = pos_weight.to(device)
-    
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-    
+    pos_weights = train_loader.dataset.get_pos_weights().to(device)
+    criterion = FocalLoss(gamma=2.0, pos_weight=pos_weights)
+
+    warmup_epochs = 5
+    base_lr = 1e-4
+    warmup_start_lr = 1e-6
+
     optimizer = optim.AdamW(
         model.parameters(),
-        lr=3e-4,
+        lr=warmup_start_lr,       # start low, warmup will ramp it
         weight_decay=1e-4
     )
-    
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=num_epochs,
-        eta_min=1e-6
-    )
+
+    def lr_lambda(epoch):
+        if epoch < warmup_epochs:
+            return (base_lr / warmup_start_lr) * ((epoch + 1) / warmup_epochs)
+        # cosine decay after warmup
+        progress = (epoch - warmup_epochs) / max(1, num_epochs - warmup_epochs)
+        return (base_lr / warmup_start_lr) * (0.5 * (1.0 + math.cos(math.pi * progress)))
+
+    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     
     early_stopping = EarlyStopping(patience=15)
     monitor = TrainingMonitor()
@@ -557,7 +604,9 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100, save_pa
         'val_loss': [], 
         'val_mAP': [],
         'grad_norm': [],
-        'update_ratio': []
+        'update_ratio': [],
+        'grad_min': [],
+        'grad_max': []
     }
     
     if resume and os.path.exists(checkpoint_path):
@@ -581,6 +630,8 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100, save_pa
         
         epoch_grad_norms = []
         epoch_update_ratios = []
+        epoch_grad_mins = []
+        epoch_grad_maxs = []
 
         for mels, labels, _ in train_bar:
             mels, labels = mels.to(device), labels.to(device).float()
@@ -590,10 +641,15 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100, save_pa
             loss = criterion(outputs, labels)
             loss.backward()
 
+            # Monitoring (before clipping and step)
             epoch_grad_norms.append(monitor.compute_gradient_norm(model))
             epoch_update_ratios.append(monitor.compute_weight_update_ratio(model, optimizer))
+            g_min, g_max = monitor.compute_grad_min_max(model)
+            epoch_grad_mins.append(g_min)
+            epoch_grad_maxs.append(g_max)
 
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            clip = 0.1 if epoch < warmup_epochs else 1.0
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip)
             
             optimizer.step()
             running_loss += loss.item()
@@ -602,6 +658,8 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100, save_pa
         avg_train_loss = running_loss / len(train_loader)
         avg_grad_norm = np.mean(epoch_grad_norms)
         avg_update_ratio = np.mean(epoch_update_ratios)
+        avg_grad_min = np.mean(epoch_grad_mins)
+        avg_grad_max = np.mean(epoch_grad_maxs)
 
         model.eval()
         val_loss = 0.0
@@ -618,6 +676,31 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100, save_pa
                 all_logits.append(outputs.cpu().numpy())
                 all_targets.append(labels.cpu().numpy())
 
+        # Prediction Spot Check
+        print("\n--- Prediction Spot Check ---")
+        try:
+            # Get first batch
+            mels_check, labels_check, _ = next(iter(val_loader))
+            mels_check = mels_check.to(device)
+            outputs_check = model(mels_check)
+            probs_check = torch.sigmoid(outputs_check)
+            
+            # Check first 3 samples
+            for i in range(min(3, len(probs_check))):
+                print(f"Sample {i}:")
+                # print(f"  Labels:     {labels_check[i].numpy()}")
+                print(f"  Label sum:  {labels_check[i].sum().item()}")
+                # print(f"  Probs:      {probs_check[i].cpu().detach().numpy()}")
+                print(f"  Prob max:   {probs_check[i].max().item():.4f}")
+            
+            print(f"=== Overall Batch Stats ===")
+            print(f"Pred mean:  {probs_check.mean():.4f}")
+            print(f"Pred max:   {probs_check.max():.4f}")
+            print(f"Preds>0.5:  {(probs_check > 0.5).sum().item()} / {probs_check.numel()}")
+            print(f"Labels sum: {labels_check.sum().item()} / {labels_check.numel()}")
+        except Exception as e:
+            print(f"Spot Check Failed: {e}")
+
         logits = np.concatenate(all_logits, axis=0)
         targets = np.concatenate(all_targets, axis=0)
         
@@ -632,6 +715,8 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100, save_pa
         history['val_mAP'].append(val_map)
         history['grad_norm'].append(float(avg_grad_norm))
         history['update_ratio'].append(float(avg_update_ratio))
+        history['grad_min'].append(float(avg_grad_min))
+        history['grad_max'].append(float(avg_grad_max))
         
         print(f"Epoch {epoch+1} Results:")
         print(f"  Train Loss:   {avg_train_loss:.4f}")
@@ -640,6 +725,7 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100, save_pa
         print(f"  AUC-ROC:      {metrics['AUC']:.4f}")
         print(f"  Macro F1:     {metrics['F1_macro']:.4f}")
         print(f"  Grad Norm:    {avg_grad_norm:.4f}")
+        print(f"  Grad Min/Max: {avg_grad_min:.2e} / {avg_grad_max:.2e}")
         print(f"  Update Ratio: {avg_update_ratio:.2e}")
         print(f"  LR:           {optimizer.param_groups[0]['lr']:.6f}")
 
@@ -661,12 +747,16 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100, save_pa
         }
         torch.save(checkpoint, checkpoint_path)
         
-        epoch_model_path = os.path.join(os.path.dirname(save_path), f"model_epoch_{epoch+1}.pth")
+        run_str = "run" + os.path.basename(save_path).split('run')[-1].split('.')[0] if 'run' in save_path else ""
+        epoch_filename = f"model_{run_str}_epoch_{epoch+1}.pth" if run_str else f"model_epoch_{epoch+1}.pth"
+        
+        epoch_model_path = os.path.join(os.path.dirname(save_path), epoch_filename)
         torch.save(model.state_dict(), epoch_model_path)
         
         if metrics_path:
             with open(metrics_path, 'w') as f:
                 json.dump(history, f, indent=4)
+            print(f\"  Metrics updated: {os.path.basename(metrics_path)}\")
         
         early_stopping(val_map)
         if early_stopping.early_stop:
@@ -678,14 +768,25 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100, save_pa
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset_path', type=str, required=True, help='Path to SONYC-UST dataset')
-    parser.add_argument('--epochs', type=int, default=30)
+    parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--batch_size', type=int, default=16)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--limit_samples', type=int, default=None)
-    parser.add_argument('--metrics_path', type=str, default='results/metrics.json', help='Path to save training metrics')
+    # Results folder path relative to script
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    default_results_dir = os.path.join(script_dir, 'results')
+    os.makedirs(default_results_dir, exist_ok=True)
+
+    # Auto-increment run counter to prevent overwrites
+    existing_runs = [f for f in os.listdir(default_results_dir) if f.startswith('metrics_run') and f.endswith('.json')]
+    run_nums = [int(f.replace('metrics_run', '').replace('.json', '')) for f in existing_runs if f.replace('metrics_run', '').replace('.json', '').isdigit()]
+    run_id = max(run_nums) + 1 if run_nums else 1
+    print(f"Starting Run #{run_id}")
+
+    parser.add_argument('--metrics_path', type=str, default=os.path.join(default_results_dir, f'metrics_run{run_id}.json'), help='Path to save training metrics')
     parser.add_argument('--resume', action='store_true', help='Resume training from last checkpoint')
-    parser.add_argument('--checkpoint_path', type=str, default='results/checkpoint_last.pth', help='Path to the last checkpoint')
-    parser.add_argument('--save_path', type=str, default='results/best_sonyc_model.pth', help='Path to save best model weights')
+    parser.add_argument('--checkpoint_path', type=str, default=os.path.join(default_results_dir, f'checkpoint_run{run_id}.pth'), help='Path to the last checkpoint')
+    parser.add_argument('--save_path', type=str, default=os.path.join(default_results_dir, f'best_model_run{run_id}.pth'), help='Path to save best model weights')
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -702,8 +803,7 @@ def main():
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=pad_truncate_collate)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=pad_truncate_collate)
 
-    pos_weight = train_dataset.get_pos_weights()
-    print(f"Positive weights for loss: {pos_weight.numpy()}")
+    # Removed pos_weight based on user request to fix gradient issues
 
     convnext_params = {
         'input_channels': 1,
@@ -731,7 +831,6 @@ def main():
                           num_epochs=args.epochs, resume=args.resume, 
                           checkpoint_path=args.checkpoint_path,
                           save_path=args.save_path,
-                          pos_weight=pos_weight,
                           metrics_path=args.metrics_path)
     
     with open(args.metrics_path, 'w') as f:
