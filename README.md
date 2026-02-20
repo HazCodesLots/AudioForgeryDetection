@@ -1,6 +1,7 @@
 ## Overview
 A comprehensive training and evaluation framework for audio classification, speaker verification, and spoof detection with a variety of architectural configurations. The implementation is organized to enable scalable experimentation across feature types and augmentation, maintaining a clean separation between data preprocessing, model components, and training logic.  
 
+### 📊 ConvNeXt-GAP  mAP: 0.30  SONYC-UST Urban Sound Tagging (23-class multi-label)
 ### 📊 LFCC-LCNN Overall EER: 0.5129% WaveFake LeaveOneVocoderOut Evaluation
 ### 📊 LFCC-LCNN Overall EER: 0.3817% WaveFake 80/20 Test Evaluation
 ### 📊 RawGAT-ST Overall EER: 2.45%, min‑tDCF: 0.1713 ASVspoof2019 Evaluation set (Closed condition)  
