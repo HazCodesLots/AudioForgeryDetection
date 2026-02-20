@@ -1,5 +1,8 @@
 ## Overview
 A comprehensive training and evaluation framework for audio classification, speaker verification, and spoof detection with a variety of architectural configurations. The implementation is organized to enable scalable experimentation across feature types and augmentation, maintaining a clean separation between data preprocessing, model components, and training logic.  
+
+### 📊 LFCC-LCNN Overall EER: 0.5129% WaveFake LeaveOneVocoderOut Evaluation
+### 📊 LFCC-LCNN Overall EER: 0.3817% WaveFake 80/20 Test Evaluation
 ### 📊 RawGAT-ST Overall EER: 2.45%, min‑tDCF: 0.1713 ASVspoof2019 Evaluation set (Closed condition)  
 ### 📊 ResNet-18 Overall EER: 1.41% LFCC 80/20 split  ODSS Validation set
 ### 📊 ResNet-18 Overall EER: 3.15% MFCC 80/20 split  ODSS Validation set
