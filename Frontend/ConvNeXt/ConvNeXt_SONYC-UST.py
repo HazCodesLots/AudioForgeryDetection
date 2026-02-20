@@ -14,6 +14,12 @@ import argparse
 import math
 from collections import defaultdict
 
+def entropy_regularisation(attn_weights, scale=0.01):
+    pool = attn_weights.mean(dim=1)
+    pool = F.softmax(pool, dim=-1)
+    entropy = -(pool * (pool + 1e-9).log()).sum(dim=-1).mean()
+    return scale * entropy
+
 
 class DropPath(nn.Module):
     """Stochastic Depth for ConvNeXt blocks."""
@@ -135,43 +141,37 @@ class ConvNeXt2D(nn.Module):
         return x
 
 class FactorizedAttentionPooling(nn.Module):
-    """
-    Two-stage attention pooling that preserves spectral-temporal structure.
-    Stage 1: Pool over frequency axis (per time step)
-    Stage 2: Pool over time axis
-    """
-    def __init__(self, input_dim=512, attention_dim=256, num_heads=4, dropout_rate=0.15):
+    def __init__(self, input_dim=512, num_heads=4):
         super().__init__()
-        self.freq_attn = nn.MultiheadAttention(
-            input_dim, num_heads, batch_first=True, dropout=dropout_rate
-        )
-        self.freq_norm = nn.LayerNorm(input_dim)
-        self.freq_dropout = nn.Dropout(dropout_rate)
-
-        self.time_attn = nn.MultiheadAttention(
-            input_dim, num_heads, batch_first=True, dropout=dropout_rate
-        )
+        self.time_attn = nn.MultiheadAttention(input_dim, num_heads, batch_first=True, dropout=0.0)
+        self.freq_attn = nn.MultiheadAttention(input_dim, num_heads, batch_first=True, dropout=0.0)
         self.time_norm = nn.LayerNorm(input_dim)
-        self.time_dropout = nn.Dropout(dropout_rate)
-
-        self.out_proj = nn.Linear(input_dim, attention_dim)
+        self.freq_norm = nn.LayerNorm(input_dim)
+        self.time_dropout = nn.Dropout(0.1)
+        self.freq_dropout = nn.Dropout(0.1)
+        self.out_proj = nn.Linear(input_dim, input_dim)
 
     def forward(self, x):
         B, C, F, T = x.shape
 
-        x_freq = x.permute(0, 3, 2, 1).contiguous().view(B * T, F, C)
-        attn_out, _ = self.freq_attn(x_freq, x_freq, x_freq)
-        x_freq = self.freq_norm(attn_out + x_freq)
-        x_freq = self.freq_dropout(x_freq)
-        x_freq = x_freq.mean(dim=1)
-        x_freq = x_freq.view(B, T, C)
+        # Stage 1: Time-first (per frequency bin independently)
+        x_t = x.permute(0, 2, 3, 1).contiguous().view(B * F, T, C)
+        attn_out, time_w = self.time_attn(x_t, x_t, x_t,
+                                           need_weights=True,
+                                           average_attn_weights=True)
+        x_t = self.time_norm(attn_out + x_t)
+        x_t = self.time_dropout(x_t)
+        x_t = x_t.mean(dim=1).view(B, F, C)       # (B, F, C)
 
-        attn_out, _ = self.time_attn(x_freq, x_freq, x_freq)
-        x_time = self.time_norm(attn_out + x_freq)
-        x_time = self.time_dropout(x_time)
-        pooled = x_time.mean(dim=1)
+        # Stage 2: Frequency
+        attn_out, freq_w = self.freq_attn(x_t, x_t, x_t,
+                                           need_weights=True,
+                                           average_attn_weights=True)
+        x_f = self.freq_norm(attn_out + x_t)
+        x_f = self.freq_dropout(x_f)
+        pooled = x_f.mean(dim=1)                   # (B, C)
 
-        return self.out_proj(pooled)
+        return self.out_proj(pooled), time_w, freq_w
 
 
 class SpecAugment(nn.Module):
@@ -218,21 +218,19 @@ class MLPClassifier(nn.Module):
     def forward(self, x):
         return self.classifier(x)
 
-class DeepFakeDetectionModel(nn.Module):
-    def __init__(self,
-                 convnext_params,
-                 attention_params,
-                 mlp_params):
+class ConvNeXtTagger(nn.Module):
+    def __init__(self, convnext_params, attention_params, mlp_params):
         super().__init__()
-
         self.convnext = ConvNeXt2D(**convnext_params)
         self.att_pool = FactorizedAttentionPooling(**attention_params)
         self.mlp = MLPClassifier(**mlp_params)
 
     def forward(self, x):
         features = self.convnext(x)
-        pooled_features = self.att_pool(features)
-        logits = self.mlp(pooled_features)
+        pooled, time_w, freq_w = self.att_pool(features)
+        logits = self.mlp(pooled)
+        if self.training:
+            return logits, time_w, freq_w
         return logits
 
 
@@ -321,6 +319,7 @@ class SONYCUSTDataset(Dataset):
             
         self.audio_dir = audio_dir
         self.frontend = frontend
+        self.split = split
         
         print(f"Building file index for {audio_dir}...")
         self.file_map = {}
@@ -362,7 +361,7 @@ class SONYCUSTDataset(Dataset):
         waveform = torch.from_numpy(waveform).float()
         
         if self.frontend:
-            mel = self.frontend(waveform, training=self.frontend.training)
+            mel = self.frontend(waveform, training=(self.split == 'train'))
         else:
             mel = waveform
             
@@ -599,8 +598,10 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100, save_pa
             mels, labels = mels.to(device), labels.to(device).float()
             
             optimizer.zero_grad()
-            outputs = model(mels)
-            loss = criterion(outputs, labels)
+            outputs, time_w, freq_w = model(mels)
+            loss = (criterion(outputs, labels)
+                  + entropy_regularisation(time_w, scale=0.01)
+                  + entropy_regularisation(freq_w, scale=0.01))
             loss.backward()
 
             epoch_grad_norms.append(monitor.compute_gradient_norm(model))
@@ -766,17 +767,15 @@ def main():
     }
     attention_params = {
         'input_dim': 512,
-        'attention_dim': 256,
         'num_heads': 4,
-        'dropout_rate': 0.15
     }
     mlp_params = {
-        'input_dim': 256,
+        'input_dim': 512,
         'num_classes': 23,
         'dropout_rate': 0.3
     }
 
-    model = DeepFakeDetectionModel(convnext_params, attention_params, mlp_params)
+    model = ConvNeXtTagger(convnext_params, attention_params, mlp_params)
     model.to(device)
 
     history = train_model(model, train_loader, val_loader, device, 
