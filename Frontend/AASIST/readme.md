@@ -37,8 +37,7 @@ Temporal   Spectral
    Classification
 ```
 
-<details>
-<summary>AASIST Architecture</summary>
+# AASIST Architecture
 
   ## Architecture Overview
 
@@ -73,7 +72,6 @@ An extended aggregation that concatenates max, mean, and stack node graph level 
 |-------------|---------------|-------------|-----------|---------|
 | 297K        | Raw waveform  | AASIST      | 0.0275    | 0.83    |
 | 85K         | Raw waveform  | AASIST-L    | 0.0309    | 0.99    |
-</details>
 
  # AASIST3: Graph Attention Anti-Spoofing with Kolmogorov-Arnold Networks
 A state-of-the-art audio deepfake detection model combining graph neural networks, heterogeneous attention mechanisms, and Kolmogorov-Arnold Network (KAN) layers for robust spoofing detection.
@@ -119,8 +117,7 @@ Input (Mel Spectrogram 128×T)
 Output Head (KAN-based) → Logits (2 classes)
 ```
 
-<details>
-<summary>AASIST3 Architecture</summary>
+# AASIST3 Architecture
 
   ## Architecture Overview
 
@@ -162,5 +159,3 @@ Fuses temporal and spatial graphs using:
 - Branch 4: 12 → 6 nodes
 
 Final embedding: [H_max_t, H_mean_t, H_max_s, H_mean_s, S_max] → 256 dim
-
-</details>​
