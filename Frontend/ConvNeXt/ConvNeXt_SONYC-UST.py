@@ -341,7 +341,8 @@ class SONYCUSTDataset(Dataset):
         
         pos_weights = neg_counts / (pos_counts + 1e-6)
         
-        pos_weights = np.clip(pos_weights, a_min=None, a_max=20.0)
+        # Cap weights to prevent gradient explosion in downsample layers
+        pos_weights = np.clip(pos_weights, a_min=None, a_max=5.0)
         
         return torch.tensor(pos_weights, dtype=torch.float32)
 
@@ -369,32 +370,6 @@ class SONYCUSTDataset(Dataset):
         labels = np.where(labels > 0, 1.0, 0.0).astype(np.float32)
         
         return mel, torch.tensor(labels), audio_name
-
-class FocalLoss(nn.Module):
-    """
-    Focal Loss for multi-label classification.
-    Down-weights easy negatives (gamma), up-weights rare positives (pos_weight).
-    """
-    def __init__(self, gamma=2.0, pos_weight=None):
-        super().__init__()
-        self.gamma = gamma
-        self.register_buffer('pos_weight', pos_weight)
-
-    def forward(self, logits, targets):
-        bce = F.binary_cross_entropy_with_logits(
-            logits, targets, reduction='none'
-        )
-        p = torch.sigmoid(logits)
-        p_t = targets * p + (1 - targets) * (1 - p)
-        focal_weight = (1 - p_t) ** self.gamma
-
-        loss = focal_weight * bce
-
-        if self.pos_weight is not None:
-            weight = targets * self.pos_weight + (1 - targets)
-            loss = loss * weight
-
-        return loss.mean()
 
 def pad_truncate_collate(batch, max_length=626):
     mels = []
@@ -554,7 +529,7 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100, save_pa
         os.makedirs(results_dir, exist_ok=True)
     
     pos_weights = train_loader.dataset.get_pos_weights().to(device)
-    criterion = FocalLoss(gamma=2.0, pos_weight=pos_weights)
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weights)
 
     warmup_epochs = 5
     base_lr = 1e-4
@@ -562,17 +537,24 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100, save_pa
 
     optimizer = optim.AdamW(
         model.parameters(),
-        lr=warmup_start_lr,
+        lr=base_lr,
         weight_decay=1e-4
     )
 
-    def lr_lambda(epoch):
-        if epoch < warmup_epochs:
-            return (base_lr / warmup_start_lr) * ((epoch + 1) / warmup_epochs)
-        progress = (epoch - warmup_epochs) / max(1, num_epochs - warmup_epochs)
-        return (base_lr / warmup_start_lr) * (0.5 * (1.0 + math.cos(math.pi * progress)))
+    warmup_val = warmup_start_lr / base_lr
+    warmup_scheduler = optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=warmup_val, end_factor=1.0, total_iters=warmup_epochs
+    )
 
-    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    cosine_scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer, T_0=15, T_mult=2, eta_min=1e-6
+    )
+
+    scheduler = optim.lr_scheduler.SequentialLR(
+        optimizer, 
+        schedulers=[warmup_scheduler, cosine_scheduler], 
+        milestones=[warmup_epochs]
+    )
     
     early_stopping = EarlyStopping(patience=15)
     monitor = TrainingMonitor()
@@ -627,7 +609,7 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100, save_pa
             epoch_grad_mins.append(g_min)
             epoch_grad_maxs.append(g_max)
 
-            clip = 0.1 if epoch < warmup_epochs else 1.0
+            clip = 0.1 if epoch < 5 else 1.0
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip)
             
             optimizer.step()
@@ -730,7 +712,7 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100, save_pa
         if metrics_path:
             with open(metrics_path, 'w') as f:
                 json.dump(history, f, indent=4)
-            print(f\"  Metrics updated: {os.path.basename(metrics_path)}\")
+            print(f"  Metrics updated: {os.path.basename(metrics_path)}")
         
         early_stopping(val_map)
         if early_stopping.early_stop:
@@ -742,7 +724,7 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100, save_pa
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset_path', type=str, required=True, help='Path to SONYC-UST dataset')
-    parser.add_argument('--epochs', type=int, default=50)
+    parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--batch_size', type=int, default=16)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--limit_samples', type=int, default=None)
