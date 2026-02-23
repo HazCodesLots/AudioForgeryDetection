@@ -35,7 +35,7 @@ script_dir = os.path.dirname(os.path.abspath(__file__))
 script_path = os.path.join(script_dir, "ConvNeXt_SONYC-UST.py")
 model_script = import_module_by_path("ConvNeXt_SONYC_UST", script_path)
 
-DeepFakeDetectionModel = model_script.DeepFakeDetectionModel
+ConvNeXtTagger = model_script.ConvNeXtTagger
 EnhancedAudioFrontend = model_script.EnhancedAudioFrontend
 SONYCUSTDataset = model_script.SONYCUSTDataset
 pad_truncate_collate = model_script.pad_truncate_collate
@@ -172,10 +172,10 @@ def run_evaluation(dataset_path, weights_path, split='validate', batch_size=16):
         'dims': [64, 128, 256, 512], 'drop_path_rate': 0.2,
         'layer_scale_init_value': 1e-6
     }
-    attention_params = {'input_dim': 512, 'attention_dim': 256, 'num_heads': 4, 'dropout_rate': 0.15}
-    mlp_params = {'input_dim': 256, 'num_classes': 23, 'dropout_rate': 0.3}
+    attention_params = {'input_dim': 512, 'num_heads': 4}
+    mlp_params = {'input_dim': 512, 'num_classes': 23, 'dropout_rate': 0.3}
 
-    model = DeepFakeDetectionModel(convnext_params, attention_params, mlp_params)
+    model = ConvNeXtTagger(convnext_params, attention_params, mlp_params)
     state_dict = torch.load(weights_path, map_location=device)
     model.load_state_dict(state_dict)
     model.to(device)

@@ -7,10 +7,22 @@ import torch.nn.functional as F
 import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader
 
-from ConvNeXt_SONYC_UST import (
-    ConvNeXtTagger, SONYCUSTDataset,
-    EnhancedAudioFrontend, pad_truncate_collate
-)
+import importlib.util
+
+def import_module_by_path(module_name, file_path):
+    spec = importlib.util.spec_from_file_location(module_name, file_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+script_dir = os.path.dirname(os.path.abspath(__file__))
+script_path = os.path.join(script_dir, "ConvNeXt_SONYC-UST.py")
+model_script = import_module_by_path("ConvNeXt_SONYC_UST", script_path)
+
+ConvNeXtTagger = model_script.ConvNeXtTagger
+SONYCUSTDataset = model_script.SONYCUSTDataset
+EnhancedAudioFrontend = model_script.EnhancedAudioFrontend
+pad_truncate_collate = model_script.pad_truncate_collate
 
 LABEL_NAMES = [
     "small-engine", "medium-engine", "large-engine",
@@ -65,8 +77,8 @@ def check_entropy(model, val_loader, device, n_batches=20):
     def entropy_from_weights(weights_list, name, seq_len):
         if not weights_list: return None
         w = torch.cat(weights_list, dim=0)
-        pool = w.mean(dim=1)
-        pool = F.softmax(pool, dim=-1)
+        # Global Query Attention weights are (B, 1, seq_len) and already normalized
+        pool = w.squeeze(1) 
         ent  = -(pool * (pool + 1e-9).log()).sum(dim=-1).mean().item()
         max_ent = np.log(seq_len)
         pct = ent / max_ent * 100
@@ -107,23 +119,16 @@ def visualise_attention_maps(model, val_loader, device, save_dir, n_samples=6):
     labels_all = torch.cat(labels_list, dim=0)[:n_samples]
     preds_all = torch.cat(preds_list, dim=0)[:n_samples]
 
-    B_sizes = [m.shape[0] for m in mels_list]
     T, F_out = 39, 8
-    freq_per_sample = []
-    offset = 0
-    for b_size in B_sizes:
-        chunk = torch.cat(freq_list, dim=0)[offset*T : (offset+b_size)*T]
-        chunk = chunk.view(b_size, T, F_out, F_out)
-        freq_per_sample.append(chunk)
-        offset += b_size
-    freq_all = torch.cat(freq_per_sample, dim=0)[:n_samples]
-    time_all = torch.cat(time_list, dim=0)[:n_samples]
+    freq_all = torch.cat(freq_list, dim=0)[:n_samples] # (n_samples, 1, F_out)
+    time_all = torch.cat(time_list, dim=0)[:n_samples * F_out] # (n_samples * F_out, 1, T)
+    time_all = time_all.view(n_samples, F_out, T) # (n_samples, F_out, T)
 
     for i in range(n_samples):
         mel = mels_all[i, 0].numpy()
-        freq_attn_map = freq_all[i].mean(dim=0).sum(dim=0).numpy()
+        freq_attn_map = freq_all[i, 0].numpy()
         freq_attn_map = freq_attn_map / (freq_attn_map.max() + 1e-9)
-        time_attn_map = time_all[i].sum(dim=0).numpy()
+        time_attn_map = time_all[i].mean(dim=0).numpy()
         time_attn_map = time_attn_map / (time_attn_map.max() + 1e-9)
         attn_2d = np.outer(freq_attn_map, time_attn_map)
         attn_up = F.interpolate(torch.tensor(attn_2d).unsqueeze(0).unsqueeze(0).float(), size=mel.shape, mode='bilinear', align_corners=False).squeeze().numpy()
@@ -158,7 +163,7 @@ def main():
     
     convnext_params  = {'input_channels':1,'depths':[2,2,6,2], 'dims':[64,128,256,512],'drop_path_rate':0.2, 'layer_scale_init_value':1e-6}
     attention_params = {'input_dim': 512, 'num_heads': 4}
-    mlp_params       = {'input_dim': 256, 'num_classes': 23, 'dropout_rate': 0.3}
+    mlp_params       = {'input_dim': 512, 'num_classes': 23, 'dropout_rate': 0.3}
 
     model = ConvNeXtTagger(convnext_params, attention_params, mlp_params)
     model.load_state_dict(torch.load(args.model_path, map_location=device))

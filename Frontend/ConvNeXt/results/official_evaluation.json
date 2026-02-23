@@ -1,0 +1,184 @@
+{
+  "model_weights": "results/best_model_run1.pth",
+  "split": "validate",
+  "n_samples": 4308,
+  "fine_level": {
+    "level": "Fine (23 classes)",
+    "macro_AUPRC": 0.2829,
+    "micro_AUPRC": 0.4936,
+    "macro_AUC_ROC": 0.7595,
+    "n_classes_evaluated": 23,
+    "n_classes_total": 23,
+    "per_class": {
+      "1-1_small-sounding-engine": {
+        "AUPRC": 0.1583,
+        "n_positive": 360,
+        "prevalence": 0.0836
+      },
+      "1-2_medium-sounding-engine": {
+        "AUPRC": 0.4249,
+        "n_positive": 1150,
+        "prevalence": 0.2669
+      },
+      "1-3_large-sounding-engine": {
+        "AUPRC": 0.5069,
+        "n_positive": 1223,
+        "prevalence": 0.2839
+      },
+      "2-1_rock-drill": {
+        "AUPRC": 0.1515,
+        "n_positive": 148,
+        "prevalence": 0.0344
+      },
+      "2-2_jackhammer": {
+        "AUPRC": 0.2874,
+        "n_positive": 206,
+        "prevalence": 0.0478
+      },
+      "2-3_hoe-ram": {
+        "AUPRC": 0.0216,
+        "n_positive": 42,
+        "prevalence": 0.0097
+      },
+      "2-4_pile-driver": {
+        "AUPRC": 0.0304,
+        "n_positive": 58,
+        "prevalence": 0.0135
+      },
+      "3-1_non-machinery-impact": {
+        "AUPRC": 0.2109,
+        "n_positive": 494,
+        "prevalence": 0.1147
+      },
+      "4-1_chainsaw": {
+        "AUPRC": 0.499,
+        "n_positive": 116,
+        "prevalence": 0.0269
+      },
+      "4-2_small-medium-rotating-saw": {
+        "AUPRC": 0.262,
+        "n_positive": 160,
+        "prevalence": 0.0371
+      },
+      "4-3_large-rotating-saw": {
+        "AUPRC": 0.3304,
+        "n_positive": 120,
+        "prevalence": 0.0279
+      },
+      "5-1_car-horn": {
+        "AUPRC": 0.5908,
+        "n_positive": 601,
+        "prevalence": 0.1395
+      },
+      "5-2_car-alarm": {
+        "AUPRC": 0.0741,
+        "n_positive": 53,
+        "prevalence": 0.0123
+      },
+      "5-3_siren": {
+        "AUPRC": 0.7652,
+        "n_positive": 301,
+        "prevalence": 0.0699
+      },
+      "5-4_reverse-beeper": {
+        "AUPRC": 0.484,
+        "n_positive": 182,
+        "prevalence": 0.0422
+      },
+      "6-1_stationary-music": {
+        "AUPRC": 0.2612,
+        "n_positive": 270,
+        "prevalence": 0.0627
+      },
+      "6-2_mobile-music": {
+        "AUPRC": 0.1819,
+        "n_positive": 144,
+        "prevalence": 0.0334
+      },
+      "6-3_ice-cream-truck": {
+        "AUPRC": 0.0082,
+        "n_positive": 28,
+        "prevalence": 0.0065
+      },
+      "7-1_person-or-small-group-talking": {
+        "AUPRC": 0.8123,
+        "n_positive": 1932,
+        "prevalence": 0.4485
+      },
+      "7-2_person-or-small-group-shouting": {
+        "AUPRC": 0.2058,
+        "n_positive": 351,
+        "prevalence": 0.0815
+      },
+      "7-3_large-crowd": {
+        "AUPRC": 0.1138,
+        "n_positive": 236,
+        "prevalence": 0.0548
+      },
+      "7-4_amplified-speech": {
+        "AUPRC": 0.053,
+        "n_positive": 47,
+        "prevalence": 0.0109
+      },
+      "8-1_dog-barking-whining": {
+        "AUPRC": 0.0738,
+        "n_positive": 86,
+        "prevalence": 0.02
+      }
+    }
+  },
+  "coarse_level": {
+    "level": "Coarse (8 classes)",
+    "macro_AUPRC": 0.4679,
+    "micro_AUPRC": 0.6518,
+    "macro_AUC_ROC": 0.7557,
+    "n_classes_evaluated": 8,
+    "n_classes_total": 8,
+    "per_class": {
+      "1_engine": {
+        "AUPRC": 0.6734,
+        "n_positive": 2070,
+        "prevalence": 0.4805
+      },
+      "2_machinery-impact": {
+        "AUPRC": 0.3217,
+        "n_positive": 385,
+        "prevalence": 0.0894
+      },
+      "3_non-machinery-impact": {
+        "AUPRC": 0.2109,
+        "n_positive": 494,
+        "prevalence": 0.1147
+      },
+      "4_powered-saw": {
+        "AUPRC": 0.5655,
+        "n_positive": 313,
+        "prevalence": 0.0727
+      },
+      "5_alert-signal": {
+        "AUPRC": 0.7385,
+        "n_positive": 1012,
+        "prevalence": 0.2349
+      },
+      "6_music": {
+        "AUPRC": 0.3265,
+        "n_positive": 369,
+        "prevalence": 0.0857
+      },
+      "7_human-voice": {
+        "AUPRC": 0.8326,
+        "n_positive": 2034,
+        "prevalence": 0.4721
+      },
+      "8_dog": {
+        "AUPRC": 0.0738,
+        "n_positive": 86,
+        "prevalence": 0.02
+      }
+    }
+  },
+  "additional": {
+    "macro_F1": 0.2771,
+    "micro_F1": 0.4737
+  }
+}

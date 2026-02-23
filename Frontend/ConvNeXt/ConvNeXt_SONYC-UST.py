@@ -15,8 +15,8 @@ import math
 from collections import defaultdict
 
 def entropy_regularisation(attn_weights, scale=0.01):
-    pool = attn_weights.mean(dim=1)
-    pool = F.softmax(pool, dim=-1)
+    # attn_weights from MHA are already softmax-normalized probabilities
+    pool = attn_weights.mean(dim=1) 
     entropy = -(pool * (pool + 1e-9).log()).sum(dim=-1).mean()
     return scale * entropy
 
@@ -143,6 +143,9 @@ class ConvNeXt2D(nn.Module):
 class FactorizedAttentionPooling(nn.Module):
     def __init__(self, input_dim=512, num_heads=4):
         super().__init__()
+        self.time_query = nn.Parameter(torch.randn(1, 1, input_dim))
+        self.freq_query = nn.Parameter(torch.randn(1, 1, input_dim))
+        
         self.time_attn = nn.MultiheadAttention(input_dim, num_heads, batch_first=True, dropout=0.0)
         self.freq_attn = nn.MultiheadAttention(input_dim, num_heads, batch_first=True, dropout=0.0)
         self.time_norm = nn.LayerNorm(input_dim)
@@ -155,23 +158,28 @@ class FactorizedAttentionPooling(nn.Module):
         B, C, F, T = x.shape
 
         # Stage 1: Time-first (per frequency bin independently)
+        # Using learnable Global Query to force specific feature selection
         x_t = x.permute(0, 2, 3, 1).contiguous().view(B * F, T, C)
-        attn_out, time_w = self.time_attn(x_t, x_t, x_t,
+        q_t = self.time_query.expand(B * F, -1, -1)
+        
+        attn_out, time_w = self.time_attn(q_t, x_t, x_t,
                                            need_weights=True,
                                            average_attn_weights=True)
-        x_t = self.time_norm(attn_out + x_t)
-        x_t = self.time_dropout(x_t)
-        x_t = x_t.mean(dim=1).view(B, F, C)       # (B, F, C)
+        # attn_out: (B*F, 1, C)
+        x_t_pooled = self.time_norm(attn_out.squeeze(1)) # (B*F, C)
+        x_t_pooled = self.time_dropout(x_t_pooled)
+        x_t_pooled = x_t_pooled.view(B, F, C)           # (B, F, C)
 
         # Stage 2: Frequency
-        attn_out, freq_w = self.freq_attn(x_t, x_t, x_t,
+        q_f = self.freq_query.expand(B, -1, -1)
+        attn_out, freq_w = self.freq_attn(q_f, x_t_pooled, x_t_pooled,
                                            need_weights=True,
                                            average_attn_weights=True)
-        x_f = self.freq_norm(attn_out + x_t)
-        x_f = self.freq_dropout(x_f)
-        pooled = x_f.mean(dim=1)                   # (B, C)
-
-        return self.out_proj(pooled), time_w, freq_w
+        # attn_out: (B, 1, C)
+        x_f_pooled = self.freq_norm(attn_out.squeeze(1)) # (B, C)
+        x_f_pooled = self.freq_dropout(x_f_pooled)
+        
+        return self.out_proj(x_f_pooled), time_w, freq_w
 
 
 class SpecAugment(nn.Module):
@@ -205,7 +213,7 @@ class MLPClassifier(nn.Module):
     """
     Lightweight classifier for multi-label audio tagging.
     """
-    def __init__(self, input_dim=256, num_classes=23, dropout_rate=0.3):
+    def __init__(self, input_dim=512, num_classes=23, dropout_rate=0.3):
         super().__init__()
         
         self.classifier = nn.Sequential(
@@ -439,32 +447,6 @@ def comprehensive_evaluation(predictions, targets, threshold=0.5):
         'Recall_sample': np.mean(recall_samples)
     }
 
-class EarlyStopping:
-    def __init__(self, patience=15, min_delta=0.001):
-        self.patience = patience
-        self.min_delta = min_delta
-        self.counter = 0
-        self.best_score = None
-        self.early_stop = False
-        
-    def __call__(self, val_map):
-        if self.best_score is None:
-            self.best_score = val_map
-        elif val_map < self.best_score + self.min_delta:
-            self.counter += 1
-            if self.counter >= self.patience:
-                self.early_stop = True
-        else:
-            self.best_score = val_map
-            self.counter = 0
-
-    def get_state(self):
-        return {
-            'counter': self.counter,
-            'best_score': self.best_score,
-            'early_stop': self.early_stop
-        }
-    
     def load_state(self, state):
         self.counter = state.get('counter', 0)
         self.best_score = state.get('best_score', None)
@@ -518,7 +500,7 @@ class TrainingMonitor:
         return all_grads.min().item(), all_grads.max().item()
 
 
-def train_model(model, train_loader, val_loader, device, num_epochs=100, save_path='results/best_sonyc_model.pth', resume=False, checkpoint_path='results/checkpoint_last.pth', metrics_path='results/metrics.json'):
+def train_model(model, train_loader, val_loader, device, num_epochs=100, save_path='results/best_sonyc_model.pth', resume=False, checkpoint_path='results/checkpoint_last.pth', metrics_path='results/metrics.json', run_name=None):
     """
     Upgraded training pipeline for SONYC-UST with imbalance handling, continuous saving, and result organization.
     """
@@ -546,7 +528,7 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100, save_pa
     )
 
     cosine_scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        optimizer, T_0=15, T_mult=2, eta_min=1e-6
+        optimizer, T_0=25, T_mult=2, eta_min=1e-6
     )
 
     scheduler = optim.lr_scheduler.SequentialLR(
@@ -555,12 +537,13 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100, save_pa
         milestones=[warmup_epochs]
     )
     
-    early_stopping = EarlyStopping(patience=15)
+    # early_stopping = EarlyStopping(patience=15) # Removed per user request for full convergence
     monitor = TrainingMonitor()
     
     start_epoch = 0
     best_map = 0.0
     history = {
+        'run_metadata': {'run_name': run_name},
         'train_loss': [], 
         'val_loss': [], 
         'val_mAP': [],
@@ -579,7 +562,7 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100, save_pa
         start_epoch = checkpoint['epoch'] + 1
         best_map = checkpoint['best_map']
         history = checkpoint['history']
-        early_stopping.load_state(checkpoint['early_stopping_state'])
+        # early_stopping.load_state(checkpoint['early_stopping_state'])
         print(f"Resumed from epoch {start_epoch}. Previous best mAP: {best_map:.4f}")
 
     for epoch in range(start_epoch, num_epochs):
@@ -700,7 +683,7 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100, save_pa
             'scheduler_state_dict': scheduler.state_dict(),
             'best_map': best_map,
             'history': history,
-            'early_stopping_state': early_stopping.get_state()
+            # 'early_stopping_state': early_stopping.get_state()
         }
         torch.save(checkpoint, checkpoint_path)
         
@@ -715,17 +698,17 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100, save_pa
                 json.dump(history, f, indent=4)
             print(f"  Metrics updated: {os.path.basename(metrics_path)}")
         
-        early_stopping(val_map)
-        if early_stopping.early_stop:
-            print(f"\nEarly stopping triggered at epoch {epoch+1}")
-            break
+        # early_stopping(val_map)
+        # if early_stopping.early_stop:
+        #     print(f"\nEarly stopping triggered at epoch {epoch+1}")
+        #     break
             
     return history
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset_path', type=str, required=True, help='Path to SONYC-UST dataset')
-    parser.add_argument('--epochs', type=int, default=100)
+    parser.add_argument('--epochs', type=int, default=150)
     parser.add_argument('--batch_size', type=int, default=16)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--limit_samples', type=int, default=None)
@@ -782,7 +765,8 @@ def main():
                           num_epochs=args.epochs, resume=args.resume, 
                           checkpoint_path=args.checkpoint_path,
                           save_path=args.save_path,
-                          metrics_path=args.metrics_path)
+                          metrics_path=args.metrics_path,
+                          run_name="ConvNeXt-OptiConv")
     
     with open(args.metrics_path, 'w') as f:
         json.dump(history, f, indent=4)
