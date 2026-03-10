@@ -32,13 +32,55 @@ def import_module_by_path(module_name, file_path):
     return module
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
-script_path = os.path.join(script_dir, "ConvNeXt_SONYC-UST.py")
-model_script = import_module_by_path("ConvNeXt_SONYC_UST", script_path)
+script_path = os.path.join(script_dir, "ConvNeXt_QueryAtt.py")
+model_script = import_module_by_path("ConvNeXt_QueryAtt", script_path)
 
 ConvNeXtTagger = model_script.ConvNeXtTagger
 EnhancedAudioFrontend = model_script.EnhancedAudioFrontend
 SONYCUSTDataset = model_script.SONYCUSTDataset
 pad_truncate_collate = model_script.pad_truncate_collate
+
+class LegacyAttentionPooling(nn.Module):
+    """
+    Legacy pooling: Standard Multihead Self-Attention followed by mean pooling.
+    Fixes the mismatch where missing 'time_query'/'freq_query' caused noise in aggregation.
+    """
+    def __init__(self, input_dim=512, num_heads=4, output_dim=512):
+        super().__init__()
+        self.time_attn = nn.MultiheadAttention(input_dim, num_heads, batch_first=True)
+        self.freq_attn = nn.MultiheadAttention(input_dim, num_heads, batch_first=True)
+        self.time_norm = nn.LayerNorm(input_dim)
+        self.freq_norm = nn.LayerNorm(input_dim)
+        self.out_proj = nn.Linear(input_dim, output_dim)
+
+    def forward(self, x):
+        B, C, F, T = x.shape
+        # Time dimension
+        x_t = x.permute(0, 2, 3, 1).contiguous().view(B * F, T, C)
+        attn_out, time_w = self.time_attn(x_t, x_t, x_t)
+        x_t_pooled = self.time_norm(attn_out.mean(dim=1)) # Global Average over time
+        x_t_pooled = x_t_pooled.view(B, F, C)
+
+        # Frequency dimension
+        attn_out, freq_w = self.freq_attn(x_t_pooled, x_t_pooled, x_t_pooled)
+        x_f_pooled = self.freq_norm(attn_out.mean(dim=1)) # Global Average over frequency
+        
+        return self.out_proj(x_f_pooled), time_w, freq_w
+
+class GAPPooling(nn.Module):
+    """
+    Pure Global Average Pooling (Pure GAP) baseline.
+    Uses no attention mechanisms.
+    """
+    def __init__(self, input_dim=512, output_dim=512):
+        super().__init__()
+        self.pooling = nn.AdaptiveAvgPool2d(1)
+        self.out_proj = nn.Linear(input_dim, output_dim) if input_dim != output_dim else nn.Identity()
+
+    def forward(self, x):
+        # x: (B, C, F, T)
+        pooled = self.pooling(x).view(x.size(0), -1)
+        return self.out_proj(pooled), None, None
 
 FINE_LABELS = [
     '1-1_small-sounding-engine',
@@ -155,7 +197,7 @@ def compute_auprc(targets, predictions, label_names, level_name="Fine"):
     }
 
 
-def run_evaluation(dataset_path, weights_path, split='validate', batch_size=16):
+def run_evaluation(dataset_path, weights_path, split='validate', batch_size=16, output_name='official_evaluation.json', calibrate=False, thresholds_path=None):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
     print(f"Weights: {weights_path}")
@@ -167,17 +209,110 @@ def run_evaluation(dataset_path, weights_path, split='validate', batch_size=16):
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False,
                         collate_fn=pad_truncate_collate, num_workers=0)
 
+    # Detect architecture based on weights path or directory
+    specialized_module = None
+    abs_weights_path = os.path.abspath(weights_path)
+    p = abs_weights_path.lower()
+    is_gap       = "globalaveragepooling" in p or "global average pooling" in p or "gap" in p and "gapgmp" not in p
+    is_legacy    = ("globalattentionpooling" in p or "global attention pooling" in p) and not is_gap
+    is_gapgmp    = "gapgmp" in p
+    is_splitband = "splitband" in p and not any(x in p for x in ["splitbandasl", "splitband_m-bce", "splitbandbcelese"])
+    is_splitbandasl   = "splitbandasl" in p
+    is_splitband_mbce = "splitband_m-bce" in p
+    is_bcelese        = "splitbandbcelese" in p
+    
+    # Base params
     convnext_params = {
         'input_channels': 1, 'depths': [2, 2, 6, 2],
         'dims': [64, 128, 256, 512], 'drop_path_rate': 0.2,
         'layer_scale_init_value': 1e-6
     }
-    attention_params = {'input_dim': 512, 'num_heads': 4}
     mlp_params = {'input_dim': 512, 'num_classes': 23, 'dropout_rate': 0.3}
+    attention_params = None
 
-    model = ConvNeXtTagger(convnext_params, attention_params, mlp_params)
+    if is_legacy:
+        print("DETECTED: Legacy GlobalAttentionPooling Architecture (Self-Attention + Mean)")
+        attention_params = {'input_dim': 512, 'num_heads': 4, 'output_dim': 512}
+        model_type = "GlobalAttentionPooling"
+    elif is_gap:
+        print("DETECTED: Pure GlobalAveragePooling Baseline (No Attention)")
+        attention_params = {'input_dim': 512, 'num_heads': 4, 'output_dim': 512}
+        model_type = "GlobalAveragePooling"
+    elif is_gapgmp or is_splitband or is_splitbandasl or is_splitband_mbce or is_bcelese:
+        if is_splitband:
+            print("DETECTED: SplitBand Fused Pooling")
+            target_script = "ConvNeXt_SplitBand.py"
+            model_type = "ConvNeXt_SplitBand"
+            pooling_params = {'input_dim': 512, 'output_dim': 512, 'dropout': 0.1}
+        elif is_gapgmp:
+            print("DETECTED: GAP+GMP Fused Pooling")
+            target_script = "ConvNeXt_GAPGMP.py"
+            model_type = "ConvNeXt_GAPGMP"
+            pooling_params = {'input_dim': 512, 'output_dim': 512, 'dropout': 0.1}
+        elif is_splitband_mbce:
+            print("DETECTED: SplitBand M-BCE (MarginBCE + High-Beta LSE + 128 Mels + 16kHz)")
+            target_script = "ConvNeXt_SplitBand_M-BCE.py"
+            model_type = "ConvNeXt_SplitBand_M-BCE"
+            pooling_params = {'input_dim': 512, 'output_dim': 512, 'dropout': 0.1, 'lse_beta': 10.0}
+        elif is_bcelese:
+            print("DETECTED: SplitBand BCE-LSE  (Weighted BCE + LSE Pooling, no margin — Ablation A)")
+            target_script = "ConvNeXt_SplitbandBCELSE.py"
+            model_type = "ConvNeXt_SplitbandBCELSE"
+            pooling_params = {'input_dim': 512, 'output_dim': 512, 'dropout': 0.1, 'lse_beta': 10.0}
+        else:
+            print("DETECTED: SplitBandASL (ASL + LSE + 256 Mels + 32kHz)")
+            target_script = "ConvNeXt_SplitBandASL.py"
+            model_type = "ConvNeXt_SplitBandASL"
+            pooling_params = {'input_dim': 512, 'output_dim': 512, 'dropout': 0.1, 'lse_beta': 5.0}
+
+        specialized_module = import_module_by_path("SpecializedModel", os.path.join(script_dir, target_script))
+
+    # Instantiate model
+    if is_gapgmp or is_splitband or is_splitbandasl or is_splitband_mbce or is_bcelese:
+        model = specialized_module.ConvNeXtTagger(convnext_params, pooling_params, mlp_params)
+    else:
+        model = ConvNeXtTagger(convnext_params, attention_params, mlp_params)
+    
+    if is_splitbandasl or is_splitband_mbce or is_bcelese:
+        # Re-instantiate dataset using specialized class
+        dataset = specialized_module.SONYCUSTDataset(csv_path, dataset_path, split=split, frontend=frontend)
+        
+        if is_splitbandasl:
+            frontend = specialized_module.EnhancedAudioFrontend(n_mels=256)
+            dataset.frontend = frontend
+            # V2/ASL: 256 mels, num_workers=0
+            loader = DataLoader(dataset, batch_size=batch_size, shuffle=False,
+                                collate_fn=specialized_module.RareClassMixupCollate(dataset),
+                                num_workers=0, pin_memory=True)
+        else: # is_splitband_mbce
+            frontend = specialized_module.EnhancedAudioFrontend(n_mels=128)
+            dataset.frontend = frontend
+            # M-BCE: 128 mels, num_workers=0 
+            loader = DataLoader(dataset, batch_size=batch_size, shuffle=False,
+                                collate_fn=specialized_module.RareClassMixupCollate(dataset),
+                                num_workers=0, pin_memory=True)
+    
+    if is_legacy:
+        # Swap the pooling layer to the legacy version before loading weights
+        model.att_pool = LegacyAttentionPooling(
+            input_dim=attention_params['input_dim'],
+            num_heads=attention_params['num_heads'],
+            output_dim=attention_params.get('output_dim', attention_params['input_dim'])
+        )
+        print("Model architecture swapped to LegacyAttentionPooling")
+    elif is_gap:
+        # Swap to Pure GAP pooling
+        model.att_pool = GAPPooling(
+            input_dim=attention_params['input_dim'],
+            output_dim=attention_params.get('output_dim', attention_params['input_dim'])
+        )
+        print("Model architecture swapped to GAPPooling (Pure GAP)")
+
     state_dict = torch.load(weights_path, map_location=device)
-    model.load_state_dict(state_dict)
+    # Filter state_dict keys for GAP model as it doesn't have att_pool.time_attn etc.
+    load_status = model.load_state_dict(state_dict, strict=True) 
+    if is_legacy:
+        print(f"Legacy Load Status: {load_status}")
     model.to(device)
     model.eval()
 
@@ -199,6 +334,42 @@ def run_evaluation(dataset_path, weights_path, split='validate', batch_size=16):
     print(f"Evaluated {len(targets)} samples")
 
     print("FINE-LEVEL EVALUATION (23 classes)")
+    # Load thresholds if provided
+    class_thresholds = np.full(23, 0.5)
+    if thresholds_path and os.path.exists(thresholds_path):
+        print(f"Loading custom thresholds from: {thresholds_path}")
+        with open(thresholds_path, 'r') as f:
+            thresh_dict = json.load(f)
+            # Match by class name or index
+            for i, name in enumerate(FINE_LABELS):
+                if name in thresh_dict:
+                    class_thresholds[i] = thresh_dict[name]
+
+    if calibrate:
+        print("Calibrating thresholds per-class on this split...")
+        if specialized_module and hasattr(specialized_module, 'calibrate_thresholds'):
+            class_thresholds = specialized_module.calibrate_thresholds(predictions, targets)
+        else:
+            # Fallback inline calibration
+            for i in range(23):
+                best_f1, best_t = 0, 0.5
+                for t in np.arange(0.05, 0.96, 0.05):
+                    p_bin = (predictions[:, i] > t).astype(int)
+                    f1 = f1_score(targets[:, i], p_bin, zero_division=0)
+                    if f1 > best_f1:
+                        best_f1, best_t = f1, t
+                class_thresholds[i] = best_t
+        
+        # Save calibrated thresholds
+        results_root = os.path.join(os.getcwd(), 'results')
+        cal_save_dir = os.path.join(results_root, model_type)
+        os.makedirs(cal_save_dir, exist_ok=True)
+        
+        cal_path = os.path.join(cal_save_dir, 'thresholds.json')
+        with open(cal_path, 'w') as f:
+            json.dump({FINE_LABELS[i]: float(class_thresholds[i]) for i in range(23)}, f, indent=2)
+        print(f"Calibrated thresholds saved to: {cal_path}")
+
     fine_results = compute_auprc(targets, predictions, FINE_LABELS, "Fine (23 classes)")
     print(f"  Macro-AUPRC:  {fine_results['macro_AUPRC']:.4f}  (PRIMARY METRIC)")
     print(f"  Micro-AUPRC:  {fine_results['micro_AUPRC']:.4f}")
@@ -229,11 +400,11 @@ def run_evaluation(dataset_path, weights_path, split='validate', batch_size=16):
         else:
             print(f"    {name:30s}  SKIPPED (no positives)")
 
-    binary_preds = (predictions > 0.5).astype(int)
+    binary_preds = (predictions > class_thresholds).astype(int)
     f1_macro = f1_score(targets, binary_preds, average='macro', zero_division=0)
     f1_micro = f1_score(targets, binary_preds, average='micro', zero_division=0)
 
-    print("ADDITIONAL METRICS (threshold=0.5)")
+    print(f"ADDITIONAL METRICS (Thresholds: {'calibrated' if calibrate or thresholds_path else 'global 0.5'})")
     print(f"  Macro F1: {f1_macro:.4f}")
     print(f"  Micro F1: {f1_micro:.4f}")
 
@@ -249,10 +420,12 @@ def run_evaluation(dataset_path, weights_path, split='validate', batch_size=16):
         }
     }
 
-    results_path = os.path.join(script_dir, 'results', 'official_evaluation.json')
+    results_dir = os.path.join(script_dir, 'results', model_type)
+    os.makedirs(results_dir, exist_ok=True)
+    results_path = os.path.join(results_dir, output_name)
     with open(results_path, 'w') as f:
         json.dump(results, f, indent=2)
-    print(f"\nResults saved to: {results_path}")
+    print(f"\nEvaluation Results saved to: {results_path}")
 
     return results
 
@@ -262,12 +435,15 @@ if __name__ == "__main__":
     parser.add_argument('--dataset_path', type=str, required=True)
     parser.add_argument('--weights', type=str, default=None,
                         help='Path to model weights. Default: results/best_sonyc_model.pth')
-    parser.add_argument('--split', type=str, default='validate',
+    parser.add_argument('--split', type=str, default='test',
                         choices=['train', 'validate', 'test'])
     parser.add_argument('--batch_size', type=int, default=16)
+    parser.add_argument('--output_name', type=str, default='official_evaluation.json')
+    parser.add_argument('--calibrate', action='store_true', help='Calibrate thresholds per-class')
+    parser.add_argument('--thresholds_path', type=str, default=None, help='Path to thresholds.json')
     args = parser.parse_args()
 
     if args.weights is None:
         args.weights = os.path.join(script_dir, 'results', 'best_sonyc_model.pth')
 
-    run_evaluation(args.dataset_path, args.weights, args.split, args.batch_size)
+    run_evaluation(args.dataset_path, args.weights, args.split, args.batch_size, args.output_name, args.calibrate, args.thresholds_path)

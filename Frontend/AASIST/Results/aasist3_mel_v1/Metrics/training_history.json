@@ -1,0 +1,27 @@
+{
+  "experiment": "aasist3_mel_v1",
+  "completed_at": "2026-02-27 01:03:23",
+  "best_eer": 51.086956521739125,
+  "best_min_dcf": 0.05,
+  "epochs_trained": 1,
+  "history": {
+    "train_loss": [
+      0.57548708319664
+    ],
+    "train_acc": [
+      90.0
+    ],
+    "val_loss": [
+      0.6901320695877076
+    ],
+    "val_eer": [
+      51.086956521739125
+    ],
+    "val_min_dcf": [
+      0.05
+    ],
+    "val_accuracy": [
+      80.0
+    ]
+  }
+}

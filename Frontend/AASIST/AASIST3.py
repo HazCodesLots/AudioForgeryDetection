@@ -82,25 +82,32 @@ class KANLayer(nn.Module):
             
         return bases.contiguous()
 
-    def _prelu(self, x: torch.Tensor):
-        
-        pos = F.relu(x)
-        neg = x - pos
-        
-        return torch.einsum('ij,...j->i...j', self.prelu_weight, neg) + pos.unsqueeze(0)
-
     def forward(self, x: torch.Tensor):
-        batch_shape = x.shape[:-1]
         x_clamped = torch.clamp(x, self.grid_range[0], self.grid_range[1])
 
-        base_output = self._prelu(x_clamped)
-
-        bspline_basis = self._compute_bspline_basis(x_clamped)
-        spline_output = torch.einsum('ijk,...jk->i...j', self.spline_coeffs, bspline_basis)
+        # 1. Optimized Base/PReLU path: avoid (out, ..., in) expansion
+        pos = F.relu(x_clamped)
+        neg = x_clamped - pos
         
-        output = torch.einsum('ij,i...j->i...', self.base_weight, base_output) + \
-                 torch.einsum('ij,i...j->i...', self.spline_weight, spline_output)
+        # Base weight on pos + (base weight * prelu weight) on neg
+        # Reshaped einsum results in (out, ...)
+        out_base = torch.einsum('ij,...j->i...', self.base_weight, pos) + \
+                   torch.einsum('ij,...j->i...', self.base_weight * self.prelu_weight, neg)
 
+        # 2. Optimized Spline path: avoid (out, ..., in) expansion
+        # bspline_basis shape: (..., in, coeffs)
+        bspline_basis = self._compute_bspline_basis(x_clamped)
+        
+        # Fuse spline_weight into spline_coeffs
+        # spline_coeffs: (out, in, coeffs), spline_weight: (out, in)
+        combined_spline_coeffs = self.spline_coeffs * self.spline_weight.unsqueeze(-1)
+        
+        # Final weighted spline sum: Sum_j Sum_k (combined_coeffs[i,j,k] * basis[..., j, k])
+        out_spline = torch.einsum('ijk,...jk->i...', combined_spline_coeffs, bspline_basis)
+        
+        output = out_base + out_spline
+
+        # Final permute to move 'out' dimension to the end
         dims = list(range(1, output.dim())) + [0]
         return output.permute(*dims).contiguous()
 
@@ -1086,15 +1093,15 @@ class MetricsCalculation:
         f1 = 2 * precision * recall / (precision + recall + 1e-8)
         
         return {
-            'eer': eer,
-            'eer_threshold': eer_threshold,
-            'min_dcf': min_dcf,
-            'accuracy': accuracy,
-            'bonafide_acc': bonafide_acc,
-            'spoof_acc': spoof_acc,
-            'precision': precision,
-            'recall': recall,
-            'f1': f1
+            'eer': float(eer),
+            'eer_threshold': float(eer_threshold),
+            'min_dcf': float(min_dcf),
+            'accuracy': float(accuracy),
+            'bonafide_acc': float(bonafide_acc),
+            'spoof_acc': float(spoof_acc),
+            'precision': float(precision),
+            'recall': float(recall),
+            'f1': float(f1)
         }
 
 
@@ -1112,7 +1119,7 @@ class TrainAASIST3:
         accumulation_steps=1,
         use_amp=True
     ):
-        self.model = model.to(device)
+        self.model = model
         self.optimizer = optimizer
         self.criterion = criterion
         self.device = device
@@ -1125,9 +1132,16 @@ class TrainAASIST3:
         self.gap_threshold = 20.0
         self.skipped_steps = 0
         
-        self.checkpoint_dir = os.path.join(checkpoint_dir, experiment_name)
-        self.weights_dir = os.path.join(self.checkpoint_dir, 'weights')
+        # Results/
+        #   <experiment_name>/
+        #     Checkpoints/   <- .pth weight files
+        #     Metrics/       <- per-epoch JSON + history JSON
+        self.results_dir     = os.path.join(checkpoint_dir, experiment_name)
+        self.checkpoint_dir  = self.results_dir          # kept for load_checkpoint compat
+        self.weights_dir     = os.path.join(self.results_dir, 'Checkpoints')
+        self.metrics_dir     = os.path.join(self.results_dir, 'Metrics')
         os.makedirs(self.weights_dir, exist_ok=True)
+        os.makedirs(self.metrics_dir,  exist_ok=True)
         
         self.experiment_name = experiment_name
         
@@ -1314,12 +1328,14 @@ class TrainAASIST3:
         
         return metrics
     
-    def fit(self, train_loader, val_loader, num_epochs, early_stopping_patience=10):
+    def fit(self, train_loader, val_loader, num_epochs, early_stopping_patience=10, start_epoch=0):
 
         print(f"Starting Training: {self.experiment_name}")
+        if start_epoch > 0:
+            print(f"  Resuming from epoch {start_epoch + 1} → {num_epochs}")
         patience_counter = 0
         
-        for epoch in range(num_epochs):
+        for epoch in range(start_epoch, num_epochs):
             self.current_epoch = epoch
             
             train_loss, train_acc, train_bn_acc, train_sp_acc, grad_stats, overfit_stats = self.train_epoch(train_loader)
@@ -1364,6 +1380,7 @@ class TrainAASIST3:
             is_best = (val_metrics['eer'] < self.best_eer)
             self.save_checkpoint(epoch + 1, is_best=is_best)
             
+            current_lr = self.optimizer.param_groups[0]['lr']
             train_info = {
                 'loss': train_loss,
                 'accuracy': train_acc,
@@ -1373,7 +1390,14 @@ class TrainAASIST3:
                 'overfit_stats': overfit_stats,
                 'skipped_steps': self.skipped_steps
             }
-            self.save_epoch_log(epoch + 1, val_metrics, train_info)
+            self.save_epoch_log(
+                epoch + 1, val_metrics, train_info,
+                is_best=is_best,
+                patience_counter=patience_counter,
+                early_stopping_patience=early_stopping_patience,
+                learning_rate=current_lr,
+                num_epochs=num_epochs
+            )
             
             if is_best:
                 self.best_eer = val_metrics['eer']
@@ -1383,7 +1407,7 @@ class TrainAASIST3:
             else:
                 patience_counter += 1
             
-            print(f"  ✓ Saved checkpoint and log for epoch {epoch+1}")
+            print(f"  ✓ Saved to Results/ — checkpoint + metrics log for epoch {epoch+1}")
             
             if patience_counter >= early_stopping_patience:
                 print(f"\n⚠ Early stopping triggered after {epoch+1} epochs")
@@ -1398,60 +1422,118 @@ class TrainAASIST3:
         self.save_history()
     
     def save_checkpoint(self, epoch, is_best=False):
-        """Save model checkpoint with custom naming."""
+        """Save model checkpoint to Results/<experiment>/Checkpoints/."""
         checkpoint = {
             'epoch': epoch,
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler is not None else None,
             'best_eer': self.best_eer,
             'best_min_dcf': self.best_min_dcf,
             'history': self.history
         }
         
-        if self.scheduler is not None:
-            checkpoint['scheduler_state_dict'] = self.scheduler.state_dict()
-        
-        filename = f"KANweightsE{epoch}.pth"
+        # Per-epoch checkpoint
+        filename = f"AASIST3_Epoch{epoch}.pth"
         filepath = os.path.join(self.weights_dir, filename)
         torch.save(checkpoint, filepath)
         
-        root_filename = f"AASIST3_Epoch{epoch}.pth"
-        torch.save(checkpoint, root_filename)
-        
+        # Best checkpoint (overwrites previous best)
         if is_best:
-            best_path = os.path.join(self.weights_dir, "KANweights_best.pth")
+            best_path = os.path.join(self.weights_dir, "AASIST3_best.pth")
             torch.save(checkpoint, best_path)
-            torch.save(checkpoint, "aasist3_best.pth")
 
-    def save_epoch_log(self, epoch, val_metrics, train_info):
-        """Save detailed per-epoch metrics."""
+    def save_epoch_log(
+        self, epoch, val_metrics, train_info,
+        is_best=False, patience_counter=0,
+        early_stopping_patience=10, learning_rate=None, num_epochs=None
+    ):
+        """Save exhaustive per-epoch metrics to Results/<experiment>/Metrics/.
+
+        Everything printed to the terminal is captured here so that
+        nothing is lost between runs.
+        """
+        ti = train_info if isinstance(train_info, dict) else {}
+        train_acc  = float(ti.get('accuracy', 0))
+        val_acc    = float(val_metrics.get('accuracy', 0))
+        train_val_gap = float(train_acc - val_acc)
+
         log_data = {
+            # ── Identity ──────────────────────────────────────────────────
+            'experiment': self.experiment_name,
             'epoch': epoch,
+            'total_epochs': num_epochs,
             'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            'train_loss': train_info['loss'] if isinstance(train_info, dict) else train_info,
-            'train_accuracy': train_info['accuracy'] if isinstance(train_info, dict) else 0,
-            'train_bonafide_acc': train_info.get('bonafide_acc', 0) if isinstance(train_info, dict) else 0,
-            'train_spoof_acc': train_info.get('spoof_acc', 0) if isinstance(train_info, dict) else 0,
-            'grad_stats': train_info.get('grad_stats', {}) if isinstance(train_info, dict) else {},
-            'overfit_stats': train_info.get('overfit_stats', {}) if isinstance(train_info, dict) else {},
-            'skipped_steps': train_info.get('skipped_steps', 0) if isinstance(train_info, dict) else self.skipped_steps,
-            'val_loss': val_metrics['loss'],
-            'val_accuracy': val_metrics['accuracy'],
-            'val_bonafide_acc': val_metrics.get('bonafide_acc', 0),
-            'val_spoof_acc': val_metrics.get('spoof_acc', 0),
-            'val_eer': val_metrics['eer'],
-            'val_min_dcf': val_metrics['min_dcf'],
-            'val_f1': val_metrics.get('f1', 0)
+
+            # ── Training metrics ──────────────────────────────────────────
+            'train': {
+                'loss':         ti.get('loss', 0),
+                'accuracy':     train_acc,
+                'bonafide_acc': ti.get('bonafide_acc', 0),
+                'spoof_acc':    ti.get('spoof_acc', 0),
+                'skipped_amp_steps': ti.get('skipped_steps', self.skipped_steps),
+            },
+
+            # ── Validation metrics ────────────────────────────────────────
+            'val': {
+                'loss':         val_metrics.get('loss', 0),
+                'accuracy':     val_acc,
+                'bonafide_acc': val_metrics.get('bonafide_acc', 0),
+                'spoof_acc':    val_metrics.get('spoof_acc', 0),
+                'eer':          val_metrics.get('eer', 0),
+                'eer_threshold':val_metrics.get('eer_threshold', 0),
+                'min_dcf':      val_metrics.get('min_dcf', 0),
+                'precision':    val_metrics.get('precision', 0),
+                'recall':       val_metrics.get('recall', 0),
+                'f1':           val_metrics.get('f1', 0),
+            },
+
+            # ── Overfitting indicators ────────────────────────────────────
+            'overfitting': {
+                'train_val_gap':    train_val_gap,
+                'red_flag_count':   ti.get('overfit_stats', {}).get('red_flag_count', 0),
+                'max_gap_observed': ti.get('overfit_stats', {}).get('max_gap_observed', 0.0),
+            },
+
+            # ── Gradient health ───────────────────────────────────────────
+            'gradient_stats': ti.get('grad_stats', {'avg': 0, 'min': 0, 'max': 0}),
+
+            # ── Optimisation state ────────────────────────────────────────
+            'optimisation': {
+                'learning_rate': learning_rate,
+            },
+
+            # ── Run-level bests ───────────────────────────────────────────
+            'bests': {
+                'is_best_epoch': bool(is_best),
+                'best_eer_so_far':    float(self.best_eer if not is_best else val_metrics.get('eer', 0)),
+                'best_min_dcf_so_far':float(self.best_min_dcf if not is_best else val_metrics.get('min_dcf', 0)),
+            },
+
+            # ── Early-stopping state ──────────────────────────────────────
+            'early_stopping': {
+                'patience_counter':        patience_counter,
+                'early_stopping_patience': early_stopping_patience,
+                'patience_remaining':      early_stopping_patience - patience_counter,
+            },
+
+            # ── Checkpoint paths ──────────────────────────────────────────
+            'checkpoint_saved': os.path.join(
+                self.weights_dir, f"AASIST3_Epoch{epoch}.pth"
+            ),
         }
-        
-        filename = f"Epoch{epoch}Log.json"
-        filepath = os.path.join(self.weights_dir, filename)
+
+        filename = f"Epoch{epoch:03d}_metrics.json"
+        filepath = os.path.join(self.metrics_dir, filename)
         with open(filepath, 'w') as f:
             json.dump(log_data, f, indent=4)
     
-    def load_checkpoint(self, filename):
-        """Load model checkpoint."""
-        filepath = os.path.join(self.checkpoint_dir, filename)
+    def load_checkpoint(self, path):
+        """Load model checkpoint from a full path or filename inside checkpoint_dir."""
+        if os.path.isabs(path) or os.path.exists(path):
+            filepath = path
+        else:
+            filepath = os.path.join(self.checkpoint_dir, path)
         checkpoint = torch.load(filepath, map_location=self.device, weights_only=False)
         
         self.model.load_state_dict(checkpoint['model_state_dict'])
@@ -1468,12 +1550,22 @@ class TrainAASIST3:
         print(f"✓ Loaded checkpoint from epoch {self.current_epoch}")
         print(f"  Best EER: {self.best_eer:.2f}%")
         print(f"  Best minDCF: {self.best_min_dcf:.4f}")
+        return self.current_epoch
     
     def save_history(self):
-        """Save training history to JSON."""
-        history_path = os.path.join(self.checkpoint_dir, 'training_history.json')
+        """Save run-level training history + best results to Results/<experiment>/Metrics/."""
+        summary = {
+            'experiment': self.experiment_name,
+            'completed_at': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            'best_eer': float(self.best_eer),
+            'best_min_dcf': float(self.best_min_dcf),
+            'epochs_trained': int(len(self.history['train_loss'])),
+            'history': self.history,
+        }
+        history_path = os.path.join(self.metrics_dir, 'training_history.json')
         with open(history_path, 'w') as f:
-            json.dump(self.history, f, indent=2)
+            json.dump(summary, f, indent=2)
+        print(f"  Results saved to: {self.results_dir}")
 
 
 def count_parameters(model):
@@ -1633,9 +1725,20 @@ def run_mel_training():
     parser.add_argument("--train_protocol", type=str, default=r"N:\ASV5\ASVspoof5.train.tsv")
     parser.add_argument("--dev_mel_dir", type=str, default=r"N:\ASV5\mel_dev\flac_D")
     parser.add_argument("--dev_protocol", type=str, default=r"N:\ASV5\ASVspoof5.dev.track_1.tsv")
-    parser.add_argument("--checkpoint_dir", type=str, default=r"N:\ASV5\checkpoints")
+    # All outputs land in: <checkpoint_dir>/<experiment_name>/Checkpoints/ and Metrics/
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    default_results = os.path.join(script_dir, 'Results')
+    parser.add_argument("--checkpoint_dir", type=str, default=default_results,
+                        help="Root results directory. Outputs go to <dir>/<experiment_name>/. "
+                             f"Default: {default_results}")
     parser.add_argument("--experiment_name", type=str, default="aasist3_mel_v1")
-    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--epochs", type=int, default=30,
+                        help="Total number of epochs to train (end epoch, inclusive).")
+    parser.add_argument("--start_epoch", type=int, default=0,
+                        help="Epoch to start/resume training from (0-indexed). Normally auto-set by --resume.")
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Path to a .pth checkpoint to resume training from. "
+                             "E.g. --resume AASIST3_Epoch3.pth")
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--max_len", type=int, default=200)
@@ -1646,6 +1749,12 @@ def run_mel_training():
     parser.add_argument("--disable_amp", action="store_true")
 
     args = parser.parse_args()
+
+    # Derive start_epoch from the epoch stored in the checkpoint
+    # (the checkpoint stores the *completed* epoch number, so resuming
+    #  should start at that epoch, i.e. the next one to run is epoch+1
+    #  which in 0-indexed terms equals checkpoint['epoch']).
+    resume_epoch = 0
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
@@ -1666,14 +1775,19 @@ def run_mel_training():
     dev_loader = DataLoader(dev_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
 
     print("Initializing AASIST3_Mel model...")
-    model = AASIST3_Mel(in_channels=128)
+    model = AASIST3_Mel(in_channels=128).to(device)
+    
+    # Optimizer MUST be created AFTER moving model to GPU
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     criterion = CombinedLoss()
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
 
     # Print training summary before starting
     print_training_summary(args, model, criterion, device)
+    
+    # GPU forward test
     print_model_summary(model, input_size=(args.batch_size, 128, args.max_len))
+    torch.cuda.empty_cache() # Ensure clean state
 
     trainer = TrainAASIST3(
         model=model,
@@ -1687,7 +1801,21 @@ def run_mel_training():
         use_amp=not args.disable_amp
     )
 
-    trainer.fit(train_loader, dev_loader, num_epochs=args.epochs, early_stopping_patience=args.patience)
+    # Load checkpoint if --resume is specified
+    if args.resume:
+        resume_epoch = trainer.load_checkpoint(args.resume)
+        print(f"  Will resume from epoch {resume_epoch + 1} → {args.epochs}")
+    
+    # --start_epoch overrides the epoch derived from the checkpoint
+    start_epoch = args.start_epoch if args.start_epoch > 0 else resume_epoch
+
+    trainer.fit(
+        train_loader,
+        dev_loader,
+        num_epochs=args.epochs,
+        early_stopping_patience=args.patience,
+        start_epoch=start_epoch
+    )
 
 if __name__ == "__main__":
     run_mel_training()
