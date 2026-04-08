@@ -447,3 +447,5 @@ if __name__ == "__main__":
         args.weights = os.path.join(script_dir, 'results', 'best_sonyc_model.pth')
 
     run_evaluation(args.dataset_path, args.weights, args.split, args.batch_size, args.output_name, args.calibrate, args.thresholds_path)
+
+    run_evaluation(args.dataset_path, args.weights, args.split, args.batch_size, args.output_name, args.calibrate, args.thresholds_path)

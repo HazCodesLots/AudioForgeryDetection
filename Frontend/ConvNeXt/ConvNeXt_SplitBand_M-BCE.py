@@ -258,7 +258,7 @@ class MelSpectrogramTransform:
         return torch.tensor(norm).unsqueeze(0).float()
 
 class SpecAugment(nn.Module):
-    def __init__(self, t_mask=40, f_mask=20):
+    def __init__(self, t_mask=30, f_mask=15):
         super().__init__()
         self.tm = t_mask
         self.fm = f_mask
@@ -302,6 +302,11 @@ class SONYCUSTDataset(Dataset):
         df_raw = pd.read_csv(csv_path)
         self.df = df_raw[df_raw['split'] == split].copy()
         self.df[self.label_cols] = self.df[self.label_cols].replace(-1, 0)
+        
+        row_sums = self.df[self.label_cols].sum(axis=1)
+        self.df = self.df[row_sums <= 10]
+        
+        print(f"Aggregating labels for {split} split (Sanitized)...")
         self.df = self.df.groupby('audio_filename')[self.label_cols].max().reset_index()
         
         self.audio_dir = audio_dir
@@ -329,7 +334,7 @@ class SONYCUSTDataset(Dataset):
         pos = labels.sum(axis=0)
         neg = len(labels) - pos
         weights = neg / (pos + 1e-6)
-        return torch.tensor(np.clip(weights, 1.0, 20.0)).float()
+        return torch.tensor(np.clip(weights, None, 5.0)).float()
 
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
@@ -419,23 +424,15 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100,
     criterion = MarginBCEWithLogitsLoss(pos_weight=pos_weights, margin=0.02)
 
     optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
-    # Smooth Cosine Schedule
-    warmup = optim.lr_scheduler.LinearLR(optimizer, start_factor=1e-3, end_factor=1.0, total_iters=5)
-    cosine = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs-5, eta_min=1e-6)
+    # Schedule: 5-epoch linear warmup -> CosineAnnealingWarmRestarts
+    warmup = optim.lr_scheduler.LinearLR(optimizer, start_factor=1e-2, end_factor=1.0, total_iters=5)
+    cosine = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer, T_0=35, T_mult=1, eta_min=1e-6
+    )
     scheduler = optim.lr_scheduler.SequentialLR(optimizer, [warmup, cosine], milestones=[5])
 
     monitor = TrainingMonitor()
-    history = {
-        'train_loss': [], 
-        'val_loss': [], 
-        'val_mAP': [], 
-        'val_AUC': [],
-        'val_F1': [],
-        'per_class_ap': defaultdict(list),
-        'grad_norm': [], 
-        'update_ratio': [], 
-        'lse_beta': []
-    }
+    history = []
     best_map, start_epoch = 0.0, 0
 
     if resume and os.path.exists(checkpoint_path):
@@ -451,6 +448,8 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100,
     for epoch in range(start_epoch, num_epochs):
         model.train()
         running_loss = 0.0
+        train_logits, train_targets_list = [], []
+        gn, ur, gmin, gmax = [], [], [], []
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")
         
         for mels, labels, _ in pbar:
@@ -459,9 +458,17 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100,
             logits = model(mels)
             loss = criterion(logits, labels)
             loss.backward()
+
+            gn.append(monitor.compute_gradient_norm(model))
+            ur.append(monitor.compute_weight_update_ratio(model, optimizer))
+            mn, mx = monitor.compute_grad_min_max(model)
+            gmin.append(mn); gmax.append(mx)
+
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             running_loss += loss.item()
+            train_logits.append(logits.detach().cpu().numpy())
+            train_targets_list.append(labels.cpu().numpy())
             pbar.set_postfix(loss=loss.item())
 
         # Eval
@@ -500,14 +507,28 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100,
         binary_preds = (preds > 0.5).astype(int)
         f1_macro = f1_score(targets, binary_preds, average='macro', zero_division=0)
         
-        history['train_loss'].append(running_loss/len(train_loader))
-        history['val_loss'].append(val_loss/len(val_loader))
-        history['val_mAP'].append(cur_map)
-        history['val_AUC'].append(float(mean_auc))
-        history['val_F1'].append(float(f1_macro))
-        history['grad_norm'].append(monitor.compute_gradient_norm(model))
-        history['update_ratio'].append(monitor.compute_weight_update_ratio(model, optimizer))
-        history['lse_beta'].append(model.pooling.lse_pool.beta.item())
+        # Train accuracy (micro-F1 at 0.5 threshold)
+        tr_preds   = 1 / (1 + np.exp(-np.concatenate(train_logits)))
+        tr_targets = np.concatenate(train_targets_list)
+        train_accuracy = float(f1_score(tr_targets, (tr_preds > 0.5).astype(int),
+                                        average='micro', zero_division=0))
+
+        val_binary = (preds > 0.5).astype(int)
+        val_accuracy = float(f1_score(targets, val_binary, average='micro', zero_division=0))
+        mean_auc = np.mean(aucs) if aucs else 0.0
+        f1_macro = f1_score(targets, val_binary, average='macro', zero_division=0)
+        lse_beta = model.pooling.lse_pool.beta.item()
+
+        history.append({
+            'epoch': epoch + 1,
+            'train_loss': float(running_loss / len(train_loader)),
+            'val_loss': float(val_loss / len(val_loader)),
+            'val_mAP': float(cur_map),
+            'grad_norm': float(np.mean(gn)),
+            'update_ratio': float(np.mean(ur)),
+            'grad_min': float(np.mean(gmin)),
+            'grad_max': float(np.mean(gmax))
+        })
 
         print(f" mAP: {cur_map:.4f} (Best: {max(best_map, cur_map):.4f}) | AUC: {mean_auc:.4f} | F1: {f1_macro:.4f} | β: {history['lse_beta'][-1]:.3f}")
         
@@ -532,7 +553,7 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100,
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset_path', type=str, required=True)
-    parser.add_argument('--epochs', type=int, default=100)
+    parser.add_argument('--epochs', type=int, default=150)
     parser.add_argument('--exp_name', type=str, default='ConvNeXt_SplitBand_M-BCE')
     parser.add_argument('--no_save', action='store_true', help='Skip saving checkpoints/metrics')
     parser.add_argument('--resume', action='store_true', help='Resume from checkpoint in exp_name folder')
@@ -543,9 +564,8 @@ def main():
     train_ds = SONYCUSTDataset(os.path.join(args.dataset_path, 'annotations.csv'), args.dataset_path, split='train', frontend=frontend)
     val_ds   = SONYCUSTDataset(os.path.join(args.dataset_path, 'annotations.csv'), args.dataset_path, split='validate', frontend=frontend)
     
-    collate = RareClassMixupCollate(train_ds)
-    # Using num_workers=0 for Windows stability with custom classes
-    train_loader = DataLoader(train_ds, batch_size=16, shuffle=True, collate_fn=collate, num_workers=0)
+    # Using num_workers=0 for Windows stability
+    train_loader = DataLoader(train_ds, batch_size=16, shuffle=True, collate_fn=pad_truncate_collate_simple, num_workers=0)
     val_loader   = DataLoader(val_ds, batch_size=16, shuffle=False, collate_fn=pad_truncate_collate_simple, num_workers=0)
 
     model = ConvNeXtTagger(

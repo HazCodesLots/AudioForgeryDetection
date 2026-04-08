@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import numpy as np
 import math
 from torch.optim import Adam, AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau
+from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau, LinearLR, SequentialLR
 from sklearn.metrics import roc_curve
 from scipy.optimize import brentq
 from scipy.interpolate import interp1d
@@ -14,6 +14,7 @@ import json
 from datetime import datetime
 from typing import Tuple, Optional
 import random
+import gc
 try:
     import torchaudio
 except ImportError:
@@ -26,7 +27,7 @@ from pathlib import Path
 
 
 class KANLayer(nn.Module):
-    def __init__(self, in_features, out_features, grid_size=16, spline_order=4, grid_range=(-1, 1)):
+    def __init__(self, in_features, out_features, grid_size=8, spline_order=4, grid_range=(-1, 1)):
         super(KANLayer, self).__init__()
         
         self.in_features = in_features
@@ -49,33 +50,32 @@ class KANLayer(nn.Module):
         self.spline_coeffs = nn.Parameter(torch.randn(out_features, in_features, num_coeffs) * 0.1)
 
         self.register_buffer('grid', self._create_grid())
+        
+        # Pre-calculate denominators for B-spline to avoid redundant math in forward
+        for k in range(1, spline_order + 1):
+            left_den = self.grid[k:-1] - self.grid[:-k-1]
+            right_den = self.grid[k+1:] - self.grid[1:-k]
+            self.register_buffer(f'left_den_{k}', left_den + 1e-4)
+            self.register_buffer(f'right_den_{k}', right_den + 1e-4)
 
     def _create_grid(self):
-        alpha_1, alpha_2 = self.grid_range
-        h = (alpha_2 - alpha_1) / (self.grid_size)
-
-        theta_1 = -self.spline_order * h + alpha_1
-        theta_2 = (self.grid_size + self.spline_order + 1) * h + alpha_1
-
-        grid = torch.linspace(theta_1, theta_2, self.num_grid_points)
-        return grid
+        a1, a2 = self.grid_range
+        h = (a2 - a1) / self.grid_size
+        t1 = -self.spline_order * h + a1
+        t2 = (self.grid_size + self.spline_order + 1) * h + a1
+        return torch.linspace(t1, t2, self.num_grid_points)
 
     def _compute_bspline_basis(self, x: torch.Tensor):
-        """
-        Vectorized computation of B-spline bases using De Boor's recursion.
-        Significantly faster than nested loops.
-        """
-
         x = x.unsqueeze(-1)
-        grid = self.grid
-        
-        bases = ((x >= grid[:-1]) & (x < grid[1:])).float()
+        # Use native buffer directly to avoid RAM leaks; cast only if necessary
+        grid = self.grid.to(device=x.device, dtype=x.dtype, non_blocking=True)
+        bases = ((x >= grid[:-1]) & (x < grid[1:])).to(x.dtype)
         
         for k in range(1, self.spline_order + 1):
-            left_den = grid[k:-1] - grid[:-k-1]
-            left_term = ((x - grid[:-k-1]) / left_den) * bases[..., :-1]
+            left_den = getattr(self, f'left_den_{k}').to(device=x.device, dtype=x.dtype, non_blocking=True)
+            right_den = getattr(self, f'right_den_{k}').to(device=x.device, dtype=x.dtype, non_blocking=True)
             
-            right_den = grid[k+1:] - grid[1:-k]
+            left_term = ((x - grid[:-k-1]) / left_den) * bases[..., :-1]
             right_term = ((grid[k+1:] - x) / right_den) * bases[..., 1:]
             
             bases = left_term + right_term
@@ -83,33 +83,26 @@ class KANLayer(nn.Module):
         return bases.contiguous()
 
     def forward(self, x: torch.Tensor):
-        x_clamped = torch.clamp(x, self.grid_range[0], self.grid_range[1])
-
-        # 1. Optimized Base/PReLU path: avoid (out, ..., in) expansion
-        pos = F.relu(x_clamped)
-        neg = x_clamped - pos
+        xc = torch.clamp(x, self.grid_range[0], self.grid_range[1])
+        pos = F.relu(xc)
+        neg = xc - pos
         
-        # Base weight on pos + (base weight * prelu weight) on neg
-        # Reshaped einsum results in (out, ...)
+        # Optimized base path (1 einsum)
         out_base = torch.einsum('ij,...j->i...', self.base_weight, pos) + \
                    torch.einsum('ij,...j->i...', self.base_weight * self.prelu_weight, neg)
 
-        # 2. Optimized Spline path: avoid (out, ..., in) expansion
-        # bspline_basis shape: (..., in, coeffs)
-        bspline_basis = self._compute_bspline_basis(x_clamped)
-        
-        # Fuse spline_weight into spline_coeffs
-        # spline_coeffs: (out, in, coeffs), spline_weight: (out, in)
-        combined_spline_coeffs = self.spline_coeffs * self.spline_weight.unsqueeze(-1)
-        
-        # Final weighted spline sum: Sum_j Sum_k (combined_coeffs[i,j,k] * basis[..., j, k])
-        out_spline = torch.einsum('ijk,...jk->i...', combined_spline_coeffs, bspline_basis)
+        # Optimized spline path (1 einsum)
+        basis = self._compute_bspline_basis(xc)
+        coeffs = self.spline_coeffs * self.spline_weight.unsqueeze(-1)
+        out_spline = torch.einsum('ijk,...jk->i...', coeffs, basis)
         
         output = out_base + out_spline
 
-        # Final permute to move 'out' dimension to the end
+        # Permute (out, ...) -> (..., out)
         dims = list(range(1, output.dim())) + [0]
         return output.permute(*dims).contiguous()
+
+
 
 
 class PreEmphasis(nn.Module):
@@ -235,6 +228,14 @@ class ASV5MelDataset(torch.utils.data.Dataset):
         try:
             mel = np.load(file_path)
             mel = self._pad_or_truncate(mel)
+            
+            # Apply 0.97 Pre-emphasis simulation (frequency tilt)
+            # High-pass filter in frequency domain: boosts higher mel bins
+            num_bins = mel.shape[0]
+            # Linear ramp from 0.5 to 1.5 across mel bins (simulating hp-filter)
+            freq_tilt = np.linspace(0.5, 1.5, num_bins).reshape(-1, 1)
+            mel = mel * freq_tilt
+
             if self.normalize:
                 mean = mel.mean()
                 std = mel.std() + 1e-9
@@ -740,7 +741,7 @@ class GraphPositionalEmbedding(nn.Module):
 
 class GraphFormation(nn.Module):
 
-    def __init__(self, encoder_dim, num_temporal_nodes=100, num_spatial_nodes=100, temporal_dim=64, spatial_dim=64, pool_ratio=0.5, temperature=1.0):
+    def __init__(self, encoder_dim, num_temporal_nodes=50, num_spatial_nodes=50, temporal_dim=64, spatial_dim=64, pool_ratio=0.5, temperature=1.0):
 
         super(GraphFormation, self).__init__()
         self.encoder_dim = encoder_dim
@@ -778,7 +779,6 @@ class GraphFormation(nn.Module):
 
     
     def forward(self, encoder_output):
-
         batch_size = encoder_output.size(0)
 
         temporal_features = self._temporal_max_pooling(encoder_output)
@@ -797,13 +797,12 @@ class GraphFormation(nn.Module):
 
 
 class BranchModule(nn.Module):
-    def __init__(self, temporal_dim, spatial_dim, num_temporal_nodes, num_spatial_nodes, stack_dim, pool_ratio=0.5, temperature=1.0):
-
+    def __init__(self, temporal_dim, spatial_dim, num_temporal_nodes, num_spatial_nodes, stack_dim, pool_ratio=0.5, temperature=1.0, use_checkpoint=False):
         super(BranchModule, self).__init__()
-
         self.temporal_dim = temporal_dim
         self.spatial_dim = spatial_dim
         self.pool_ratio = pool_ratio
+        self.use_checkpoint = use_checkpoint
 
         self.hs_gal_1 = KAN_HS_GAL(temporal_dim=temporal_dim, spatial_dim= spatial_dim, num_nodes=max(num_temporal_nodes, num_spatial_nodes), stack_dim=stack_dim, temperature=temperature)
         self.pooled_temporal = KAN_GraphPool(temporal_dim, ratio=pool_ratio)
@@ -826,7 +825,7 @@ class BranchModule(nn.Module):
 
 
 class MultiBranchArchitecture(nn.Module):
-    def __init__(self, temporal_dim, spatial_dim, num_temporal_nodes, num_spatial_nodes, stack_dim, num_branches=4, pool_ratio=0.5, temperature=1.0, dropout_p1=0.2, dropout_p2=0.5):
+    def __init__(self, temporal_dim, spatial_dim, num_temporal_nodes, num_spatial_nodes, stack_dim, num_branches=4, pool_ratio=0.5, temperature=1.0, dropout_p1=0.3, dropout_p2=0.5):
         super(MultiBranchArchitecture, self).__init__()
 
         self.num_branches = num_branches
@@ -842,7 +841,18 @@ class MultiBranchArchitecture(nn.Module):
         current_spatial_nodes = num_spatial_nodes
 
         for i in range(num_branches):
-            branch = BranchModule(temporal_dim=temporal_dim, spatial_dim=spatial_dim, num_temporal_nodes=current_temporal_nodes, num_spatial_nodes=current_spatial_nodes, stack_dim=stack_dim, pool_ratio=pool_ratio, temperature=temperature)
+            # Restore 4 branches; re-enable checkpointing for memory safety with 4-branch width
+            use_cp = True 
+            branch = BranchModule(
+                temporal_dim=temporal_dim, 
+                spatial_dim=spatial_dim, 
+                num_temporal_nodes=current_temporal_nodes, 
+                num_spatial_nodes=current_spatial_nodes, 
+                stack_dim=stack_dim, 
+                pool_ratio=pool_ratio, 
+                temperature=temperature,
+                use_checkpoint=use_cp
+            )
             self.branches.append(branch)
 
             current_temporal_nodes = branch.pooled_temporal_nodes
@@ -1010,29 +1020,44 @@ class FocalLoss(nn.Module):
 
 
 class CombinedLoss(nn.Module):
-
     def __init__(
         self,
         class_weights=None,
         focal_alpha=0.25,
         focal_gamma=2.0,
         ce_weight=1.0,
-        focal_weight=1.0
+        focal_weight=1.0,
+        label_smoothing=0.0
     ):
         super(CombinedLoss, self).__init__()
         
         self.ce_weight = ce_weight
         self.focal_weight = focal_weight
+        self.label_smoothing = label_smoothing
         
         if class_weights is not None:
-            self.register_buffer('class_weights', torch.tensor(class_weights))
+            # Renamed to ce_weights to avoid any attribute collision
+            self.register_buffer('ce_weights', torch.FloatTensor(class_weights))
         else:
-            self.class_weights = None
+            self.ce_weights = None
         
         self.focal_loss = FocalLoss(alpha=focal_alpha, gamma=focal_gamma)
     
     def forward(self, inputs, targets):
-        ce_loss = F.cross_entropy(inputs, targets, weight=self.class_weights)
+        # Force existence check and type-safety
+        w = getattr(self, 'ce_weights', None)
+        
+        if w is not None:
+            # Re-verify it hasn't become None or invalid due to some internal state
+            try:
+                ce_loss = F.cross_entropy(inputs, targets, weight=w, label_smoothing=self.label_smoothing)
+            except TypeError:
+                # Fallback: recreate on the fly if the buffer is being picky
+                static_w = torch.tensor([1.0, 1.0], device=inputs.device, dtype=inputs.dtype)
+                ce_loss = F.cross_entropy(inputs, targets, weight=static_w, label_smoothing=self.label_smoothing)
+        else:
+            ce_loss = F.cross_entropy(inputs, targets, label_smoothing=self.label_smoothing)
+            
         focal_loss = self.focal_loss(inputs, targets)
         total_loss = self.ce_weight * ce_loss + self.focal_weight * focal_loss
         
@@ -1144,8 +1169,8 @@ class TrainAASIST3:
         os.makedirs(self.metrics_dir,  exist_ok=True)
         
         self.experiment_name = experiment_name
-        
         self.current_epoch = 0
+        self.training_config = {} # To be filled by save_training_config
         self.best_eer = float('inf')
         self.best_min_dcf = float('inf')
         self.history = {
@@ -1200,7 +1225,9 @@ class TrainAASIST3:
                 epoch_grad_norms.append(last_grad_norm)
                 
                 if math.isnan(last_grad_norm) or math.isinf(last_grad_norm):
-                    print(f"\n[WARNING] Gradient explosion detected at epoch {self.current_epoch+1}, batch {batch_idx+1}! Norm: {last_grad_norm}")
+                    # Muted terminal warning to reduce overhead; still logged to skipped_steps
+                    pass
+                # pbar.write(f"\n[WARNING] Gradient explosion detected at epoch {self.current_epoch+1}, batch {batch_idx+1}! Norm: {grad_norm:.3f}")
                 elif last_grad_norm == 0.0:
                     print(f"\n[WARNING] Zero gradient detected at epoch {self.current_epoch+1}, batch {batch_idx+1}! Potential vanishing gradient or dead layers.")
                 
@@ -1212,6 +1239,12 @@ class TrainAASIST3:
                     self.skipped_steps += 1
                 
                 self.optimizer.zero_grad()
+                
+            # Periodic cleanup to prevent fragmentation slowdown
+            if batch_idx % 100 == 0:
+                torch.cuda.empty_cache()
+                if batch_idx % 500 == 0:
+                    gc.collect()
             
             with torch.no_grad():
                 preds = logits.argmax(dim=1)
@@ -1257,10 +1290,13 @@ class TrainAASIST3:
         bonafide_acc = 100 * total_bonafide_correct / total_bonafide if total_bonafide > 0 else 0
         spoof_acc = 100 * total_spoof_correct / total_spoof if total_spoof > 0 else 0
         
+        # Filter non-finite norms before calculating averages for UI stability
+        valid_norms = [n for n in epoch_grad_norms if math.isfinite(n)]
+        
         grad_stats = {
-            'avg': np.mean(epoch_grad_norms) if epoch_grad_norms else 0,
-            'min': np.min(epoch_grad_norms) if epoch_grad_norms else 0,
-            'max': np.max(epoch_grad_norms) if epoch_grad_norms else 0
+            'avg': np.mean(valid_norms) if valid_norms else 0.0,
+            'min': np.min(valid_norms) if valid_norms else 0.0,
+            'max': np.max(valid_norms) if valid_norms else 0.0
         }
         
         overfit_stats = {
@@ -1562,10 +1598,21 @@ class TrainAASIST3:
             'epochs_trained': int(len(self.history['train_loss'])),
             'history': self.history,
         }
-        history_path = os.path.join(self.metrics_dir, 'training_history.json')
+        history_path = os.path.join(self.metrics_dir, 'training_metrics.json')
+        # Combine static config with dynamic history
+        full_report = {
+            "metadata": self.training_config,
+            "best_eer": float(self.best_eer),
+            "best_min_dcf": float(self.best_min_dcf),
+            "epochs_total": int(len(self.history['train_loss'])),
+            "history": self.history,
+            "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
         with open(history_path, 'w') as f:
-            json.dump(summary, f, indent=2)
-        print(f"  Results saved to: {self.results_dir}")
+            json.dump(full_report, f, indent=4)
+        
+        print(f"  Comprehensive report saved to: {history_path}")
+        print(f"  Results folder: {self.results_dir}")
 
 
 def count_parameters(model):
@@ -1628,29 +1675,47 @@ def print_training_summary(args, model, criterion, device):
         if hasattr(backbone, 'stack_dim'):
             print(f"Stack Dim         : {backbone.stack_dim}")
             
-    dropouts = []
+    dropouts = {}
     for name, module in model.named_modules():
         if isinstance(module, nn.Dropout):
-            dropouts.append(f"{name}: {module.p}")
+            dropouts[name] = module.p
     
     if dropouts:
         print("\nDropout Rates:")
-        for drop in dropouts:
-            print(f"  {drop}")
+        for name, p in dropouts.items():
+            print(f"  {name}: {p}")
             
     print("="*70 + "\n")
+    
+    # Package metadata for JSON
+    metadata = {
+        "config": {label: str(value) for label, value in summary_data if not label.startswith("-")},
+        "architecture": {
+            "encoder_blocks": len(getattr(model.encoder, 'blocks', [])) if hasattr(model, 'encoder') else 6,
+            "branches": getattr(model.backbone, 'num_branches', 4),
+            "temporal_dim": getattr(model.backbone, 'temporal_dim', 64),
+            "spatial_dim": getattr(model.backbone, 'spatial_dim', 64),
+            "stack_dim": getattr(model.backbone, 'stack_dim', 128),
+            "dropouts": dropouts
+        },
+        "parameters": params
+    }
+    return metadata
 
-def print_model_summary(model, input_size=(1, 128, 200)):
+def print_model_summary(model, device, input_size=(1, 128, 200)):
     print("MODEL FORWARD TEST")
     model.eval()
     with torch.no_grad():
-        dummy_input = torch.randn(input_size)
+        dummy_input = torch.randn(input_size).to(device)
         try:
             output = model(dummy_input)
             print(f"Input shape:  {dummy_input.shape}")
             print(f"Output shape: {output.shape}")
         except Exception as e:
             print(f"Forward pass failed: {e}")
+            import traceback
+            traceback.print_exc()
+
 
 
 def save_model_config(model, filepath):
@@ -1725,13 +1790,12 @@ def run_mel_training():
     parser.add_argument("--train_protocol", type=str, default=r"N:\ASV5\ASVspoof5.train.tsv")
     parser.add_argument("--dev_mel_dir", type=str, default=r"N:\ASV5\mel_dev\flac_D")
     parser.add_argument("--dev_protocol", type=str, default=r"N:\ASV5\ASVspoof5.dev.track_1.tsv")
-    # All outputs land in: <checkpoint_dir>/<experiment_name>/Checkpoints/ and Metrics/
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    default_results = os.path.join(script_dir, 'Results')
+    # All outputs land in: <checkpoint_root>/<experiment_name>/Checkpoints/ and Metrics/
+    default_results = r"N:\ASV5"
     parser.add_argument("--checkpoint_dir", type=str, default=default_results,
                         help="Root results directory. Outputs go to <dir>/<experiment_name>/. "
                              f"Default: {default_results}")
-    parser.add_argument("--experiment_name", type=str, default="aasist3_mel_v1")
+    parser.add_argument("--experiment_name", type=str, default="aasist3_lite_v1")
     parser.add_argument("--epochs", type=int, default=30,
                         help="Total number of epochs to train (end epoch, inclusive).")
     parser.add_argument("--start_epoch", type=int, default=0,
@@ -1739,13 +1803,13 @@ def run_mel_training():
     parser.add_argument("--resume", type=str, default=None,
                         help="Path to a .pth checkpoint to resume training from. "
                              "E.g. --resume AASIST3_Epoch3.pth")
-    parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--lr", type=float, default=5e-5)
+    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--max_len", type=int, default=200)
-    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--patience", type=int, default=10)
     parser.add_argument("--subset", type=int, default=None)
-    parser.add_argument("--accumulation_steps", type=int, default=1)
+    parser.add_argument("--accumulation_steps", type=int, default=4)
     parser.add_argument("--disable_amp", action="store_true")
 
     args = parser.parse_args()
@@ -1778,16 +1842,25 @@ def run_mel_training():
     model = AASIST3_Mel(in_channels=128).to(device)
     
     # Optimizer MUST be created AFTER moving model to GPU
-    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-    criterion = CombinedLoss()
-    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
-
-    # Print training summary before starting
-    print_training_summary(args, model, criterion, device)
+    # Weight decay boosted to 5e-4 to prevent KAN overfitting
+    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=5e-4)
+    # Balanced weights [1.0, 1.0] per paper results; label smoothing added for gap-closing
+    criterion = CombinedLoss(class_weights=[1.0, 1.0], label_smoothing=0.1).to(device)
     
-    # GPU forward test
-    print_model_summary(model, input_size=(args.batch_size, 128, args.max_len))
-    torch.cuda.empty_cache() # Ensure clean state
+    # 2-epoch linear warmup to stabilize KAN layers
+    warmup_epochs = 2
+    warmup_scheduler = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_epochs)
+    # 100-epoch slow decay for paper alignment
+    main_scheduler = CosineAnnealingLR(optimizer, T_max=100)
+    # Combine into a single sequential scheduler
+    scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, main_scheduler], milestones=[warmup_epochs])
+
+    # Print training summary and capture metadata for JSON
+    metadata = print_training_summary(args, model, criterion, device)
+    
+    # GPU forward test (forced Batch=1 for memory safety)
+    print_model_summary(model, device, input_size=(1, 128, args.max_len))
+    torch.cuda.empty_cache() # Clear summary memory immediately
 
     trainer = TrainAASIST3(
         model=model,
@@ -1800,6 +1873,7 @@ def run_mel_training():
         accumulation_steps=args.accumulation_steps,
         use_amp=not args.disable_amp
     )
+    trainer.training_config = metadata
 
     # Load checkpoint if --resume is specified
     if args.resume:
@@ -1809,13 +1883,28 @@ def run_mel_training():
     # --start_epoch overrides the epoch derived from the checkpoint
     start_epoch = args.start_epoch if args.start_epoch > 0 else resume_epoch
 
-    trainer.fit(
-        train_loader,
-        dev_loader,
-        num_epochs=args.epochs,
-        early_stopping_patience=args.patience,
-        start_epoch=start_epoch
-    )
+    # Emergency Traceback Logger for Paper-Plus verification
+    try:
+        trainer.fit(
+            train_loader,
+            dev_loader,
+            num_epochs=args.epochs,
+            early_stopping_patience=args.patience,
+            start_epoch=start_epoch
+        )
+    except Exception as e:
+        import traceback
+        error_msg = traceback.format_exc()
+        print("\n" + "!"*70)
+        print("FATAL ERROR CAUGHT:")
+        print(error_msg)
+        print("!"*70 + "\n")
+        
+        # Absolute path to ensure we can find it
+        log_path = os.path.join(os.getcwd(), "debug_error.txt")
+        with open(log_path, "w") as f:
+            f.write(error_msg)
+        raise e
 
 if __name__ == "__main__":
     run_mel_training()

@@ -88,8 +88,12 @@ class ConvNeXtBlock(nn.Module):
 
 
 class ConvNeXt2D(nn.Module):
-    def __init__(self, input_channels=1, depths=[2,2,6,2], dims=[64,128,256,512],
-                 drop_path_rate=0.2, layer_scale_init_value=1e-5):
+    def __init__(self,
+                 input_channels=1,
+                 depths=[2, 2, 6, 2],
+                 dims=[64, 128, 256, 512],
+                 drop_path_rate=0.2,
+                 layer_scale_init_value=1e-5):
         super().__init__()
         self.stem = nn.Sequential(
             nn.Conv2d(input_channels, dims[0], kernel_size=2, stride=2),
@@ -152,16 +156,14 @@ class LSEPool2d(nn.Module):
         return (1.0 / r) * torch.logsumexp(r * flat, dim=-1)
 
 
-class SplitBandPoolingBCELSE(nn.Module):
+class SplitBandLSEPooling(nn.Module):
     """
-    Frequency-split pooling using LSE (not GMP as in V1).
-    Low  band  (0–4 kHz): GAP + LSE
-    High band  (4–8 kHz): GAP + LSE
-    → 4 × C features concatenated, projected to output_dim.
+    Splits the 128 Mel bins into Low (0-64) and High (64-128).
+    Applies Log-Sum-Exp (LSE) pooling to both, concatenates, and projects to 512.
     """
-    def __init__(self, input_dim=512, output_dim=512, dropout=0.1, lse_beta=10.0):
+    def __init__(self, input_dim=512, output_dim=512, dropout=0.3, initial_beta=1.0):
         super().__init__()
-        self.lse_pool = LSEPool2d(init_beta=lse_beta)
+        self.lse_pool = LSEPool2d(init_beta=initial_beta)
         self.proj = nn.Sequential(
             nn.Linear(input_dim * 4, output_dim),
             nn.LayerNorm(output_dim),
@@ -190,7 +192,7 @@ class SplitBandPoolingBCELSE(nn.Module):
 class MLPClassifier(nn.Module):
     def __init__(self, input_dim=512, num_classes=23, dropout_rate=0.3):
         super().__init__()
-        self.net = nn.Sequential(
+        self.classifier = nn.Sequential(
             nn.Linear(input_dim, 256),
             nn.LayerNorm(256),
             nn.GELU(),
@@ -198,18 +200,21 @@ class MLPClassifier(nn.Module):
             nn.Linear(256, num_classes)
         )
     def forward(self, x):
-        return self.net(x)
+        return self.classifier(x)
 
 
 class ConvNeXtTagger(nn.Module):
+    """
+    ConvNeXt + Frequency-Split GAP/LSE Pooling + Standardized MLP.
+    """
     def __init__(self, convnext_params, pooling_params, mlp_params):
         super().__init__()
-        self.backbone = ConvNeXt2D(**convnext_params)
-        self.pooling  = SplitBandPoolingBCELSE(**pooling_params)
-        self.mlp      = MLPClassifier(**mlp_params)
+        self.convnext = ConvNeXt2D(**convnext_params)
+        self.pool = SplitBandLSEPooling(**pooling_params)
+        self.mlp = MLPClassifier(**mlp_params)
 
     def forward(self, x):
-        return self.mlp(self.pooling(self.backbone(x)))
+        return self.mlp(self.pool(self.convnext(x)))
 
 
 # ---------------------------------------------------------------------------
@@ -255,7 +260,7 @@ class EnhancedAudioFrontend(nn.Module):
     def __init__(self, n_mels=128):
         super().__init__()
         self.mel_transform = MelSpectrogramTransform(sample_rate=16000, n_mels=n_mels)
-        self.spec_augment  = SpecAugment()
+        self.spec_augment  = SpecAugment(t_mask=30, f_mask=15)
 
     def forward(self, waveform, training=True):
         mel = self.mel_transform(waveform)
@@ -290,6 +295,11 @@ class SONYCUSTDataset(Dataset):
         df_raw = pd.read_csv(csv_path)
         self.df = df_raw[df_raw['split'] == split].copy()
         self.df[self.label_cols] = self.df[self.label_cols].replace(-1, 0)
+        
+        row_sums = self.df[self.label_cols].sum(axis=1)
+        self.df = self.df[row_sums <= 10]
+        
+        print(f"Aggregating labels for {split} split (Sanitized)...")
         self.df = self.df.groupby('audio_filename')[self.label_cols].max().reset_index()
         self.audio_dir = audio_dir
         self.frontend  = frontend
@@ -317,7 +327,7 @@ class SONYCUSTDataset(Dataset):
         labels = self.df[self.label_cols].values
         pos    = labels.sum(axis=0)
         neg    = len(labels) - pos
-        return torch.tensor(np.clip(neg / (pos + 1e-6), 1.0, 20.0)).float()
+        return torch.tensor(np.clip(neg / (pos + 1e-6), 1.0, 5.0)).float()
 
     def __getitem__(self, idx):
         row  = self.df.iloc[idx]
@@ -371,16 +381,26 @@ def pad_truncate_collate(batch, max_len=626):
 # ---------------------------------------------------------------------------
 
 class TrainingMonitor:
-    def gradient_norm(self, model):
-        return sum(p.grad.data.norm(2).item() ** 2
-                   for p in model.parameters() if p.grad is not None) ** 0.5
+    def compute_gradient_norm(self, model):
+        total_norm = 0.0
+        for param in model.parameters():
+            if param.grad is not None:
+                total_norm += param.grad.data.norm(2).item() ** 2
+        return total_norm ** 0.5
 
-    def update_ratio(self, model, optimizer):
+    def compute_weight_update_ratio(self, model, optimizer):
         lr = optimizer.param_groups[0]['lr']
         ratios = [(lr * p.grad.data).norm(2).item() / p.data.norm(2).item()
                   for p in model.parameters()
                   if p.grad is not None and p.data.norm(2).item() > 1e-8]
         return float(np.mean(ratios)) if ratios else 0.0
+
+    def compute_grad_min_max(self, model):
+        grads = [p.grad.data.view(-1) for p in model.parameters() if p.grad is not None]
+        if not grads:
+            return 0.0, 0.0
+        all_grads = torch.cat(grads)
+        return all_grads.min().item(), all_grads.max().item()
 
 
 # ---------------------------------------------------------------------------
@@ -388,11 +408,18 @@ class TrainingMonitor:
 # ---------------------------------------------------------------------------
 
 def train_model(model, train_loader, val_loader, device, num_epochs=100,
-                exp_name='ConvNeXt_SplitbandBCELSE',
+                exp_name='ConvNeXt_Splitband_BCELSE',
                 resume=False, no_save=False):
+    """
+    Standardized training pipeline — identical hyperparameters across all 3 models.
+    JSON: list of per-epoch dicts with train_loss, train_accuracy, val_loss, val_accuracy,
+          val_mAP, val_AUC, val_F1_macro, gradients {grad_norm, grad_min, grad_max, update_ratio},
+          and lse_beta (learnable pooling beta — unique to this ablation model).
+    """
 
-    save_dir        = os.path.join('results', exp_name)
-    save_path       = os.path.join(save_dir, 'best_model.pth')
+    script_dir      = os.path.dirname(os.path.abspath(__file__))
+    save_dir        = os.path.join(script_dir, 'results', exp_name)
+    save_path       = os.path.join(save_dir, f'{exp_name}.pth')
     checkpoint_path = os.path.join(save_dir, 'checkpoint.pth')
     metrics_path    = os.path.join(save_dir, 'metrics.json')
 
@@ -406,23 +433,20 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100,
         reduction='mean'
     )
 
-    # ----- Optimizer + Cosine Schedule with Warmup -----
     optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
-    warmup    = optim.lr_scheduler.LinearLR(optimizer, start_factor=1e-3,
+
+    # ----- Optimizer + Cosine Schedule with Warmup -----
+    # Schedule: 5-epoch linear warmup -> CosineAnnealingWarmRestarts
+    warmup    = optim.lr_scheduler.LinearLR(optimizer, start_factor=1e-2,
                                             end_factor=1.0, total_iters=5)
-    cosine    = optim.lr_scheduler.CosineAnnealingLR(optimizer,
-                                                      T_max=num_epochs - 5,
-                                                      eta_min=1e-6)
+    cosine    = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer, T_0=35, T_mult=1, eta_min=1e-6
+    )
     scheduler = optim.lr_scheduler.SequentialLR(optimizer, [warmup, cosine],
                                                 milestones=[5])
 
     monitor  = TrainingMonitor()
-    history  = {
-        'train_loss': [], 'val_loss': [], 'val_mAP': [],
-        'val_AUC': [], 'val_F1': [],
-        'per_class_ap': defaultdict(list),
-        'grad_norm': [], 'update_ratio': [], 'lse_beta': []
-    }
+    history  = []   # list of per-epoch dicts
     best_map, start_epoch = 0.0, 0
 
     if resume and os.path.exists(checkpoint_path):
@@ -433,28 +457,42 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100,
         start_epoch = ckpt['epoch'] + 1
         best_map    = ckpt['best_map']
         history     = ckpt['history']
-        if not isinstance(history.get('per_class_ap'), defaultdict):
-            history['per_class_ap'] = defaultdict(list, history.get('per_class_ap', {}))
         print(f"Resumed from epoch {start_epoch}, best mAP so far: {best_map:.4f}")
 
     for epoch in range(start_epoch, num_epochs):
         # --- Train ---
         model.train()
         running_loss = 0.0
+        train_logits, train_targets_list = [], []
+        gn, ur, gmin, gmax = [], [], [], []
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")
+
         for mels, labels, _ in pbar:
             mels, labels = mels.to(device), labels.to(device)
             optimizer.zero_grad()
-            logits = model(mels)
-            loss   = criterion(logits, labels)
+            outputs = model(mels)
+            loss   = criterion(outputs, labels)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+            gn.append(monitor.compute_gradient_norm(model))
+            ur.append(monitor.compute_weight_update_ratio(model, optimizer))
+            mn, mx = monitor.compute_grad_min_max(model)
+            gmin.append(mn); gmax.append(mx)
+
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.1 if epoch < 5 else 1.0)
             optimizer.step()
             running_loss += loss.item()
+            train_logits.append(outputs.detach().cpu().numpy())
+            train_targets_list.append(labels.cpu().numpy())
             pbar.set_postfix(loss=f"{loss.item():.4f}")
 
+        # Train accuracy (micro-F1 at 0.5 threshold)
+        tr_preds   = 1 / (1 + np.exp(-np.concatenate(train_logits)))
+        tr_targets = np.concatenate(train_targets_list)
+        train_acc  = float(f1_score(tr_targets, (tr_preds > 0.5).astype(int),
+                                    average='micro', zero_division=0))
+
         # --- Validate ---
-        model.eval()
         val_loss, all_preds, all_targets = 0.0, [], []
         with torch.no_grad():
             for mels, labels, _ in val_loader:
@@ -469,31 +507,39 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100,
 
         # Per-class AUPRC
         aps, class_names = [], val_loader.dataset.label_cols
+        per_class = {}
         for i in range(23):
             if targets[:, i].sum() > 0:
                 ap = average_precision_score(targets[:, i], preds[:, i])
                 aps.append(ap)
-                history['per_class_ap'][class_names[i]].append(float(ap))
+                per_class[class_names[i]] = round(float(ap), 6)
             else:
-                history['per_class_ap'][class_names[i]].append(0.0)
+                per_class[class_names[i]] = 0.0
         cur_map = float(np.mean(aps)) if aps else 0.0
 
-        # AUC + F1
-        aucs = [roc_auc_score(targets[:, i], preds[:, i])
-                for i in range(23) if len(np.unique(targets[:, i])) > 1]
+        aucs    = [roc_auc_score(targets[:, i], preds[:, i])
+                   for i in range(23) if len(np.unique(targets[:, i])) > 1]
         mean_auc  = float(np.mean(aucs)) if aucs else 0.0
         f1_macro  = float(f1_score(targets, (preds > 0.5).astype(int),
                                    average='macro', zero_division=0))
+        f1_micro  = float(f1_score(targets, (preds > 0.5).astype(int),
+                                   average='micro', zero_division=0))
         lse_beta  = model.pooling.lse_pool.beta.item()
 
-        history['train_loss'].append(running_loss / len(train_loader))
-        history['val_loss'].append(val_loss / len(val_loader))
-        history['val_mAP'].append(cur_map)
-        history['val_AUC'].append(mean_auc)
-        history['val_F1'].append(f1_macro)
-        history['grad_norm'].append(monitor.gradient_norm(model))
-        history['update_ratio'].append(monitor.update_ratio(model, optimizer))
-        history['lse_beta'].append(lse_beta)
+        # --- Gradients (computed on current model state after step) ---
+        gn  = monitor.gradient_norm(model) if any(p.grad is not None for p in model.parameters()) else 0.0
+        ur  = monitor.update_ratio(model, optimizer)
+
+        history.append({
+            'epoch': epoch + 1,
+            'train_loss': float(avg_train_loss),
+            'val_loss': float(avg_val_loss),
+            'val_mAP': float(cur_map),
+            'grad_norm': float(gn),
+            'update_ratio': float(ur),
+            'grad_min': float(np.mean(gmin)),
+            'grad_max': float(np.mean(gmax))
+        })
 
         best_tag = ''
         if cur_map > best_map:
@@ -502,6 +548,8 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100,
             if not no_save:
                 torch.save(model.state_dict(), save_path)
 
+        print(f"  Train Loss: {epoch_record['train_loss']:.4f} | Train Acc: {train_acc:.4f}")
+        print(f"  Val   Loss: {epoch_record['val_loss']:.4f}   | Val   Acc: {f1_micro:.4f}")
         print(f"  mAP: {cur_map:.4f} (Best: {best_map:.4f}) | "
               f"AUC: {mean_auc:.4f} | F1: {f1_macro:.4f} | "
               f"β: {lse_beta:.3f} | LR: {optimizer.param_groups[0]['lr']:.2e}"
@@ -514,10 +562,10 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100,
                 'epoch': epoch, 'model': model.state_dict(),
                 'optimizer': optimizer.state_dict(),
                 'scheduler': scheduler.state_dict(),
-                'best_map': best_map, 'history': dict(history)
+                'best_map': best_map, 'history': history
             }, checkpoint_path)
             with open(metrics_path, 'w') as f:
-                json.dump(dict(history), f, indent=4)
+                json.dump(history, f, indent=2)
 
     return history
 
@@ -528,19 +576,16 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="ConvNeXt SplitBand with Weighted BCE + LSE Pooling (Ablation A)")
+        description="ConvNeXt SplitBand BCE-LSE (Ablation A) — Fair Retraining")
     parser.add_argument('--dataset_path', type=str, required=True)
-    parser.add_argument('--epochs',       type=int, default=100)
+    parser.add_argument('--epochs',       type=int, default=150)
     parser.add_argument('--batch_size',   type=int, default=16)
-    parser.add_argument('--seed',         type=int, default=42,
-                        help='Random seed for reproducibility')
-    parser.add_argument('--exp_name',     type=str, default='ConvNeXt_SplitbandBCELSE')
+    parser.add_argument('--seed',         type=int, default=42)
+    parser.add_argument('--exp_name',     type=str, default='ConvNeXt_Splitband_BCELSE')
     parser.add_argument('--resume',       action='store_true')
-    parser.add_argument('--no_save',      action='store_true',
-                        help='Dry-run: skip all checkpoint/metric saving')
+    parser.add_argument('--no_save',      action='store_true')
     args = parser.parse_args()
 
-    # Reproducibility
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
@@ -555,7 +600,7 @@ def main():
 
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
-        collate_fn=RareClassMixupCollate(train_ds),
+        collate_fn=pad_truncate_collate,
         num_workers=0, pin_memory=True
     )
     val_loader = DataLoader(
@@ -568,7 +613,7 @@ def main():
         convnext_params = {'depths': [2, 2, 6, 2], 'dims': [64, 128, 256, 512],
                            'drop_path_rate': 0.2, 'layer_scale_init_value': 1e-5},
         pooling_params  = {'input_dim': 512, 'output_dim': 512,
-                           'dropout': 0.1, 'lse_beta': 10.0},
+                           'dropout': 0.1, 'initial_beta': 10.0},
         mlp_params      = {'input_dim': 512, 'num_classes': 23, 'dropout_rate': 0.3}
     ).to(device)
 

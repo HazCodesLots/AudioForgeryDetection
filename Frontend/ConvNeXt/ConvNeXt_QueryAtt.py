@@ -213,17 +213,14 @@ class SpecAugment(nn.Module):
         return x
 
 class MLPClassifier(nn.Module):
-    """
-    Lightweight classifier for multi-label audio tagging.
-    """
     def __init__(self, input_dim=512, num_classes=23, dropout_rate=0.3):
         super().__init__()
-        
         self.classifier = nn.Sequential(
-            nn.Linear(input_dim, 128),
-            nn.ReLU(),
+            nn.Linear(input_dim, 256),
+            nn.LayerNorm(256),
+            nn.GELU(),
             nn.Dropout(dropout_rate),
-            nn.Linear(128, num_classes)
+            nn.Linear(256, num_classes)
         )
     
     def forward(self, x):
@@ -350,11 +347,7 @@ class SONYCUSTDataset(Dataset):
         neg_counts = total_counts - pos_counts
         
         pos_weights = neg_counts / (pos_counts + 1e-6)
-        
-        # Cap weights to prevent gradient explosion in downsample layers
-        pos_weights = np.clip(pos_weights, a_min=None, a_max=5.0)
-        
-        return torch.tensor(pos_weights, dtype=torch.float32)
+        return torch.tensor(np.clip(pos_weights, None, 5.0), dtype=torch.float32)
 
     def __len__(self):
         return len(self.df)
@@ -380,6 +373,34 @@ class SONYCUSTDataset(Dataset):
         labels = np.where(labels > 0, 1.0, 0.0).astype(np.float32)
         
         return mel, torch.tensor(labels), audio_name
+
+
+class RareClassMixupCollate:
+    """Picklable collate fn for Rare-Class Mixup (Windows-safe)."""
+    def __init__(self, dataset, p_mixup=0.5, max_len=626):
+        self.dataset, self.p_mixup, self.max_len = dataset, p_mixup, max_len
+
+    def _resize(self, mel):
+        if mel.shape[-1] > self.max_len:  return mel[..., :self.max_len]
+        if mel.shape[-1] < self.max_len:  return F.pad(mel, (0, self.max_len - mel.shape[-1]))
+        return mel
+
+    def __call__(self, batch):
+        mels, labels, names = [], [], []
+        for mel, label, name in batch:
+            mel = self._resize(mel)
+            if self.dataset.split == 'train' and np.random.rand() < self.p_mixup:
+                rc = np.random.choice(self.dataset.rare_classes)
+                if len(self.dataset.rare_class_indices[rc]) > 0:
+                    ridx  = np.random.choice(self.dataset.rare_class_indices[rc])
+                    r_mel, r_label, _ = self.dataset[ridx]
+                    r_mel = self._resize(r_mel)
+                    lam   = np.random.beta(0.4, 0.4)
+                    mel   = lam * mel + (1 - lam) * r_mel
+                    label = torch.max(label, r_label)
+            mels.append(mel); labels.append(label); names.append(name)
+        return torch.stack(mels), torch.stack(labels), names
+
 
 def pad_truncate_collate(batch, max_length=626):
     mels = []
@@ -525,35 +546,27 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100, save_pa
         weight_decay=1e-4
     )
 
+    # Schedule: 5-epoch linear warmup -> CosineAnnealingWarmRestarts
     warmup_val = warmup_start_lr / base_lr
     warmup_scheduler = optim.lr_scheduler.LinearLR(
         optimizer, start_factor=warmup_val, end_factor=1.0, total_iters=warmup_epochs
     )
-
     cosine_scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        optimizer, T_0=25, T_mult=2, eta_min=1e-6
+        optimizer, T_0=35, T_mult=1, eta_min=1e-6
     )
-
     scheduler = optim.lr_scheduler.SequentialLR(
         optimizer, 
         schedulers=[warmup_scheduler, cosine_scheduler], 
         milestones=[warmup_epochs]
     )
-    
-    # early_stopping = EarlyStopping(patience=15) # Removed per user request for full convergence
+
     monitor = TrainingMonitor()
-    
     start_epoch = 0
     best_map = 0.0
     history = {
         'run_metadata': {'run_name': run_name},
-        'train_loss': [], 
-        'val_loss': [], 
-        'val_mAP': [],
-        'grad_norm': [],
-        'update_ratio': [],
-        'grad_min': [],
-        'grad_max': []
+        'train_loss': [], 'val_loss': [], 'val_mAP': [],
+        'grad_norm': [], 'update_ratio': [], 'grad_min': [], 'grad_max': []
     }
     
     if resume and os.path.exists(checkpoint_path):
@@ -580,6 +593,12 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100, save_pa
         epoch_grad_mins = []
         epoch_grad_maxs = []
 
+        running_loss = 0.0
+        train_logits, train_targets_list = [], []
+        train_bar = tqdm(train_loader, desc="Training")
+        
+        epoch_grad_norms, epoch_update_ratios, epoch_grad_mins, epoch_grad_maxs = [], [], [], []
+
         for mels, labels, _ in train_bar:
             mels, labels = mels.to(device), labels.to(device).float()
             
@@ -601,13 +620,16 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100, save_pa
             
             optimizer.step()
             running_loss += loss.item()
+            train_logits.append(outputs.detach().cpu().numpy())
+            train_targets_list.append(labels.cpu().numpy())
             train_bar.set_postfix(loss=loss.item())
 
         avg_train_loss = running_loss / len(train_loader)
-        avg_grad_norm = np.mean(epoch_grad_norms)
-        avg_update_ratio = np.mean(epoch_update_ratios)
-        avg_grad_min = np.mean(epoch_grad_mins)
-        avg_grad_max = np.mean(epoch_grad_maxs)
+        
+        # --- Train accuracy (micro-F1 at 0.5 threshold) ---
+        tr_preds   = 1 / (1 + np.exp(-np.concatenate(train_logits)))
+        tr_targets = np.concatenate(train_targets_list)
+        train_accuracy = float(f1_score(tr_targets, (tr_preds > 0.5).astype(int), average='micro', zero_division=0))
 
         model.eval()
         val_loss = 0.0
@@ -624,42 +646,21 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100, save_pa
                 all_logits.append(outputs.cpu().numpy())
                 all_targets.append(labels.cpu().numpy())
 
-        print("\n--- Prediction Spot Check ---")
-        try:
-            mels_check, labels_check, _ = next(iter(val_loader))
-            mels_check = mels_check.to(device)
-            outputs_check = model(mels_check)
-            probs_check = torch.sigmoid(outputs_check)
-
-            for i in range(min(3, len(probs_check))):
-                print(f"Sample {i}:")
-                print(f"  Label sum:  {labels_check[i].sum().item()}")
-                print(f"  Prob max:   {probs_check[i].max().item():.4f}")
-            
-            print(f"=== Overall Batch Stats ===")
-            print(f"Pred mean:  {probs_check.mean():.4f}")
-            print(f"Pred max:   {probs_check.max():.4f}")
-            print(f"Preds>0.5:  {(probs_check > 0.5).sum().item()} / {probs_check.numel()}")
-            print(f"Labels sum: {labels_check.sum().item()} / {labels_check.numel()}")
-        except Exception as e:
-            print(f"Spot Check Failed: {e}")
-
         logits = np.concatenate(all_logits, axis=0)
         targets = np.concatenate(all_targets, axis=0)
-        
         predictions = 1 / (1 + np.exp(-logits))
-        
         metrics = comprehensive_evaluation(predictions, targets)
         avg_val_loss = val_loss / len(val_loader)
         val_map = metrics['mAP']
-        
+        val_accuracy = float(f1_score(targets, (predictions > 0.5).astype(int), average='micro', zero_division=0))
+
         history['train_loss'].append(avg_train_loss)
         history['val_loss'].append(avg_val_loss)
         history['val_mAP'].append(val_map)
-        history['grad_norm'].append(float(avg_grad_norm))
-        history['update_ratio'].append(float(avg_update_ratio))
-        history['grad_min'].append(float(avg_grad_min))
-        history['grad_max'].append(float(avg_grad_max))
+        history['grad_norm'].append(float(np.mean(epoch_grad_norms)))
+        history['update_ratio'].append(float(np.mean(epoch_update_ratios)))
+        history['grad_min'].append(float(np.mean(epoch_grad_mins)))
+        history['grad_max'].append(float(np.mean(epoch_grad_maxs)))
         
         print(f"Epoch {epoch+1} Results:")
         print(f"  Train Loss:   {avg_train_loss:.4f}")
@@ -716,7 +717,7 @@ def main():
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--limit_samples', type=int, default=None)
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    default_results_dir = os.path.join(script_dir, 'results')
+    default_results_dir = os.path.join(script_dir, 'results', 'ConvNeXt_QueryAtt')
     os.makedirs(default_results_dir, exist_ok=True)
 
     existing_runs = [f for f in os.listdir(default_results_dir) if f.startswith('metrics_run') and f.endswith('.json')]

@@ -190,14 +190,14 @@ class GAPGMPPooling(nn.Module):
 
 
 class MLPClassifier(nn.Module):
-    """Lightweight classifier for multi-label audio tagging."""
     def __init__(self, input_dim=512, num_classes=23, dropout_rate=0.3):
         super().__init__()
         self.classifier = nn.Sequential(
-            nn.Linear(input_dim, 128),
-            nn.ReLU(),
+            nn.Linear(input_dim, 256),
+            nn.LayerNorm(256),
+            nn.GELU(),
             nn.Dropout(dropout_rate),
-            nn.Linear(128, num_classes)
+            nn.Linear(256, num_classes)
         )
 
     def forward(self, x):
@@ -329,15 +329,21 @@ class SONYCUSTDataset(Dataset):
                     self.file_map[f] = os.path.join(root, f)
         print(f"Index built with {len(self.file_map)} unique audio files.")
 
+        if split == 'train':
+            labels = self.df[self.label_cols].values
+            prev = labels.mean(axis=0)
+            self.rare_classes = np.where(prev < 0.05)[0]
+            self.rare_class_indices = {c: np.where(labels[:, c] > 0.5)[0]
+                                       for c in self.rare_classes}
+            print(f"Rare classes identified: {len(self.rare_classes)} / 23")
+
     def get_pos_weights(self):
         labels = self.df[self.label_cols].values
         binary_labels = np.where(labels > 0, 1.0, 0.0)
         pos_counts = binary_labels.sum(axis=0)
-        total_counts = len(binary_labels)
-        neg_counts = total_counts - pos_counts
+        neg_counts = len(binary_labels) - pos_counts
         pos_weights = neg_counts / (pos_counts + 1e-6)
-        pos_weights = np.clip(pos_weights, a_min=None, a_max=5.0)
-        return torch.tensor(pos_weights, dtype=torch.float32)
+        return torch.tensor(np.clip(pos_weights, None, 5.0), dtype=torch.float32)
 
     def __len__(self):
         return len(self.df)
@@ -357,6 +363,33 @@ class SONYCUSTDataset(Dataset):
         labels = row[self.label_cols].values.astype(np.float32)
         labels = np.where(labels > 0, 1.0, 0.0).astype(np.float32)
         return mel, torch.tensor(labels), audio_name
+
+
+class RareClassMixupCollate:
+    """Picklable collate fn for Rare-Class Mixup (Windows-safe)."""
+    def __init__(self, dataset, p_mixup=0.5, max_len=626):
+        self.dataset, self.p_mixup, self.max_len = dataset, p_mixup, max_len
+
+    def _resize(self, mel):
+        if mel.shape[-1] > self.max_len:  return mel[..., :self.max_len]
+        if mel.shape[-1] < self.max_len:  return F.pad(mel, (0, self.max_len - mel.shape[-1]))
+        return mel
+
+    def __call__(self, batch):
+        mels, labels, names = [], [], []
+        for mel, label, name in batch:
+            mel = self._resize(mel)
+            if self.dataset.split == 'train' and np.random.rand() < self.p_mixup:
+                rc = np.random.choice(self.dataset.rare_classes)
+                if len(self.dataset.rare_class_indices[rc]) > 0:
+                    ridx  = np.random.choice(self.dataset.rare_class_indices[rc])
+                    r_mel, r_label, _ = self.dataset[ridx]
+                    r_mel = self._resize(r_mel)
+                    lam   = np.random.beta(0.4, 0.4)
+                    mel   = lam * mel + (1 - lam) * r_mel
+                    label = torch.max(label, r_label)
+            mels.append(mel); labels.append(label); names.append(name)
+        return torch.stack(mels), torch.stack(labels), names
 
 
 def pad_truncate_collate(batch, max_length=626):
@@ -451,18 +484,18 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100,
 
     optimizer = optim.AdamW(model.parameters(), lr=base_lr, weight_decay=1e-4)
 
-    # Schedule: 5-epoch linear warmup → single cosine decay to eta_min.
-    # No restarts — prevents the aggressive re-warm that caused val-loss explosion
-    # in SplitBand run 1 around epoch 80+.
+    # Schedule: 5-epoch linear warmup -> CosineAnnealingWarmRestarts
     warmup_val = warmup_start_lr / base_lr
     warmup_scheduler = optim.lr_scheduler.LinearLR(
         optimizer, start_factor=warmup_val, end_factor=1.0, total_iters=warmup_epochs
     )
-    cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=num_epochs - warmup_epochs, eta_min=1e-6
+    cosine_scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer, T_0=35, T_mult=1, eta_min=1e-6
     )
     scheduler = optim.lr_scheduler.SequentialLR(
-        optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_epochs]
+        optimizer, 
+        schedulers=[warmup_scheduler, cosine_scheduler], 
+        milestones=[warmup_epochs]
     )
 
     monitor = TrainingMonitor()
@@ -489,6 +522,7 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100,
         print(f"\nEpoch {epoch+1}/{num_epochs}")
         model.train()
         running_loss = 0.0
+        train_logits, train_targets_list = [], []
         train_bar = tqdm(train_loader, desc="Training")
         epoch_grad_norms, epoch_update_ratios, epoch_grad_mins, epoch_grad_maxs = [], [], [], []
 
@@ -509,6 +543,8 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100,
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip)
             optimizer.step()
             running_loss += loss.item()
+            train_logits.append(outputs.detach().cpu().numpy())
+            train_targets_list.append(labels.cpu().numpy())
             train_bar.set_postfix(loss=loss.item())
 
         avg_train_loss = running_loss / len(train_loader)
@@ -531,6 +567,14 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100,
         avg_val_loss = val_loss / len(val_loader)
         val_map = metrics['mAP']
 
+        # Train accuracy (micro-F1 at 0.5)
+        tr_preds   = 1 / (1 + np.exp(-np.concatenate(train_logits)))
+        tr_targets = np.concatenate(train_targets_list)
+        train_accuracy = float(f1_score(tr_targets, (tr_preds > 0.5).astype(int), average='micro', zero_division=0))
+
+        val_binary = (predictions > 0.5).astype(int)
+        val_accuracy = float(f1_score(targets, val_binary, average='micro', zero_division=0))
+
         history['train_loss'].append(avg_train_loss)
         history['val_loss'].append(avg_val_loss)
         history['val_mAP'].append(val_map)
@@ -539,13 +583,10 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100,
         history['grad_min'].append(float(np.mean(epoch_grad_mins)))
         history['grad_max'].append(float(np.mean(epoch_grad_maxs)))
 
-        print(f"Epoch {epoch+1} Results:")
-        print(f"  Train Loss:   {avg_train_loss:.4f}")
-        print(f"  Val Loss:     {avg_val_loss:.4f}")
-        print(f"  mAP:          {val_map:.4f}")
-        print(f"  AUC-ROC:      {metrics['AUC']:.4f}")
-        print(f"  Macro F1:     {metrics['F1_macro']:.4f}")
-        print(f"  LR:           {optimizer.param_groups[0]['lr']:.6f}")
+
+        print(f"  Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
+        print(f"  mAP: {val_map:.4f} | AUC: {metrics['AUC']:.4f} | F1-macro: {metrics['F1_macro']:.4f}")
+        print(f"  LR:  {optimizer.param_groups[0]['lr']:.6f}")
 
         if val_map > best_map:
             best_map = val_map

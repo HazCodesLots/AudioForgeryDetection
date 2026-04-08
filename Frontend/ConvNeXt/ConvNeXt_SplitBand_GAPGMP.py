@@ -196,10 +196,11 @@ class MLPClassifier(nn.Module):
     def __init__(self, input_dim=512, num_classes=23, dropout_rate=0.3):
         super().__init__()
         self.classifier = nn.Sequential(
-            nn.Linear(input_dim, 128),
-            nn.ReLU(),
+            nn.Linear(input_dim, 256),
+            nn.LayerNorm(256),
+            nn.GELU(),
             nn.Dropout(dropout_rate),
-            nn.Linear(128, num_classes)
+            nn.Linear(256, num_classes)
         )
 
     def forward(self, x):
@@ -333,12 +334,22 @@ class SONYCUSTDataset(Dataset):
                     self.file_map[f] = os.path.join(root, f)
         print(f"Index built with {len(self.file_map)} unique audio files.")
 
+        # Precompute rare class mapping for Mixup
+        if split == 'train':
+            labels = self.df[self.label_cols].values
+            prevalence = labels.mean(axis=0)
+            # Threshold for rare: < 5% prevalence
+            self.rare_classes = np.where(prevalence < 0.05)[0]
+            self.rare_class_indices = {c: np.where(labels[:, c] > 0.5)[0] for c in self.rare_classes}
+            print(f"Rare classes identified for Mixup: {len(self.rare_classes)} / 23")
+
     def get_pos_weights(self):
         labels = self.df[self.label_cols].values
         binary_labels = np.where(labels > 0, 1.0, 0.0)
         pos_counts = binary_labels.sum(axis=0)
         neg_counts = len(binary_labels) - pos_counts
-        pos_weights = neg_counts / (pos_counts + 1e-6)
+        pos_weights = neg_counts / pos_counts
+        # Exact champion clipping (5.0) from the 0.33 run
         return torch.tensor(np.clip(pos_weights, None, 5.0), dtype=torch.float32)
 
     def __len__(self):
@@ -354,7 +365,6 @@ class SONYCUSTDataset(Dataset):
         mel = self.frontend(waveform, training=(self.split == 'train')) if self.frontend else waveform
         labels = np.where(row[self.label_cols].values.astype(np.float32) > 0, 1.0, 0.0).astype(np.float32)
         return mel, torch.tensor(labels), audio_name
-
 
 def pad_truncate_collate(batch, max_length=626):
     mels, labels, names = [], [], []
@@ -415,15 +425,20 @@ def train_model(model, train_loader, val_loader, device, num_epochs=150,
     base_lr = 1e-4
     optimizer = optim.AdamW(model.parameters(), lr=base_lr, weight_decay=1e-4)
 
-    # Schedule: 5-epoch linear warmup → single cosine decay to eta_min over the
-    # remaining epochs.  No restarts — avoids the aggressive LR spikes that caused
-    # val-loss explosion after epoch 80 in run 1.
+    # Schedule: 5-epoch linear warmup -> CosineAnnealingWarmRestarts
+    # Champion Truth: The 0.33 run used restarts and peaked VERY early (Epoch 15).
+    warmup_val = 1e-6 / base_lr
     warmup_scheduler = optim.lr_scheduler.LinearLR(
-        optimizer, start_factor=1e-6 / base_lr, end_factor=1.0, total_iters=warmup_epochs)
-    cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=num_epochs - warmup_epochs, eta_min=1e-6)
+        optimizer, start_factor=warmup_val, end_factor=1.0, total_iters=warmup_epochs
+    )
+    cosine_scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer, T_0=35, T_mult=1, eta_min=1e-6
+    )
     scheduler = optim.lr_scheduler.SequentialLR(
-        optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_epochs])
+        optimizer, 
+        schedulers=[warmup_scheduler, cosine_scheduler], 
+        milestones=[warmup_epochs]
+    )
 
     monitor = TrainingMonitor()
     start_epoch = 0
@@ -531,7 +546,8 @@ def main():
     parser.add_argument('--limit_samples', type=int, default=None)
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    default_results_dir = os.path.join(script_dir, 'results', 'ConvNeXt_SplitBand')
+    # Isolated directory to prevent collision with other SplitBand variants
+    default_results_dir = os.path.join(script_dir, 'results', 'ConvNeXt_SplitBand_GAPGMP')
     os.makedirs(default_results_dir, exist_ok=True)
 
     existing_runs = [f for f in os.listdir(default_results_dir)
