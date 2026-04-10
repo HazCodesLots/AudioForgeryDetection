@@ -17,7 +17,7 @@ class GraphPositionalEmbedding(nn.Module):
 
 class GraphFormation(nn.Module):
 
-    def __init__(self, encoder_dim, num_temporal_nodes = 100, , num_spatial_nodes = 100, temporal_dim = 64, spatial_dim = 64, pool_ratio = 0.5, temperature = 1.0):
+    def __init__(self, encoder_dim, num_temporal_nodes = 100, num_spatial_nodes = 100, temporal_dim = 64, spatial_dim = 64, pool_ratio = 0.5, temperature = 1.0):
 
         super(GraphFormation, self).__init__()
         self.encoder_dim = encoder_dim
