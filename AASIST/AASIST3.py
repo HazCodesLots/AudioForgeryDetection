@@ -1927,10 +1927,14 @@ def run_raw_training():
     from torch.utils.data import DataLoader
     
     parser = argparse.ArgumentParser(description="AASIST3 Raw Waveform Training")
-    parser.add_argument("--train_audio_dir", type=str, default=r"N:\ASV5\train\flac_T")
-    parser.add_argument("--train_protocol", type=str, default=r"N:\ASV5\ASVspoof5.train.tsv")
-    parser.add_argument("--dev_audio_dir", type=str, default=r"N:\ASV5\dev\flac_D")
-    parser.add_argument("--dev_protocol", type=str, default=r"N:\ASV5\ASVspoof5.dev.track_1.tsv")
+    # Updated to your new dataset location
+    dataset_root = r"C:\Users\HazCodes\Documents\Datasets\ASVspoof5"
+    
+    parser.add_argument("--train_audio_dir", type=str, default=os.path.join(dataset_root, "flac_T"))
+    parser.add_argument("--train_protocol", type=str, default=os.path.join(dataset_root, "ASVspoof5.train.tsv"))
+    parser.add_argument("--dev_audio_dir", type=str, default=os.path.join(dataset_root, "flac_D"))
+    parser.add_argument("--dev_protocol", type=str, default=os.path.join(dataset_root, "ASVspoof5.dev.track_1.tsv"))
+    
     default_results = r"N:\ASV5"
     parser.add_argument("--checkpoint_dir", type=str, default=default_results,
                         help="Root results directory. Outputs go to <dir>/<experiment_name>/. "
