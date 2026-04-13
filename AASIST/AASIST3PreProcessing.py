@@ -1,24 +1,24 @@
 
-class PreEmphasis(nn.Module:):
+class PreEmphasis(nn.Module):
     def __init__(self, coef=0.97):
         super(PreEmphasis, self).__init__()
         self.coef = coef
         self.register_buffer('flipped_filter', torch.FloatTensor([-self.coef, 1.0]).unsqueeze(0).unsqueeze(0))
 
-        def forward(self, x: torch.Tensor) -> torch.Tensor:
-            if x.dim() == 2:
-                x = x.unsqueeze(1)
-                squeeze_output = True
-            else:
-                squeeze_output = False
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() == 2:
+            x = x.unsqueeze(1)
+            squeeze_output = True
+        else:
+            squeeze_output = False
 
-            x_padded = torch.nn.functional.pad(x, (1, 0), mode='replicate')
-            x_preemphasized = torch.nn.functional.conv1d(x_padded, self.flipped_filter)
+        x_padded = torch.nn.functional.pad(x, (1, 0), mode='replicate')
+        x_preemphasized = torch.nn.functional.conv1d(x_padded, self.flipped_filter)
 
-            if squeeze_output:
-                x_preemphasized = x_preemphasized.squeeze(1)
+        if squeeze_output:
+            x_preemphasized = x_preemphasized.squeeze(1)
 
-            return x_preemphasized
+        return x_preemphasized
 
 
 class AudioProcessor:
@@ -66,7 +66,7 @@ class AudioProcessor:
 
         num_windows = 1 + (audio_length - window_samples) // stride_samples
 
-        if (audio_length - windows_samples) % stride_samples !=0:
+        if (audio_length - window_samples) % stride_samples != 0:
             num_windows += 1
 
         windows = []
@@ -88,7 +88,7 @@ class AudioProcessor:
 
 class PositionalEmbedding(nn.Module):
 
-    def __init__(self, d_model: int, max_len: int = 5000, temprature: int = 10000):
+    def __init__(self, d_model: int, max_len: int = 5000, temperature: int = 10000):
         super(PositionalEmbedding, self).__init__()
 
         self.d_model = d_model
@@ -96,7 +96,7 @@ class PositionalEmbedding(nn.Module):
         pe = torch.zeros(max_len, d_model)
         position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
 
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(temprature) / d_model))
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(temperature) / d_model))
 
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)

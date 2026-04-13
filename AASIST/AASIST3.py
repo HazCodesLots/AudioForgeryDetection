@@ -5,6 +5,7 @@ import numpy as np
 import math
 from torch.optim import Adam, AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau, LinearLR, SequentialLR
+import torch.utils.checkpoint as checkpoint
 from sklearn.metrics import roc_curve
 from scipy.optimize import brentq
 from scipy.interpolate import interp1d
@@ -23,6 +24,10 @@ except OSError:
     torchaudio = None
 import pandas as pd
 from pathlib import Path
+try:
+    from transformers import Wav2Vec2Model
+except ImportError:
+    Wav2Vec2Model = None
 
 
 
@@ -113,6 +118,105 @@ class PreEmphasis(nn.Module):
         return x_preemphasized
 
 
+class SincConv(nn.Module):
+    """
+    Sinc-based convolution layer for raw waveform processing (SincNet).
+    Learns band-pass filters based on cutoff frequencies.
+    """
+    @staticmethod
+    def to_mel(hz):
+        return 2595 * np.log10(1 + hz / 700)
+
+    @staticmethod
+    def to_hz(mel):
+        return 700 * (10**(mel / 2595) - 1)
+
+    def __init__(self, out_channels, kernel_size, sample_rate=16000, min_low_hz=50, min_band_hz=50):
+        super(SincConv, self).__init__()
+
+        if kernel_size % 2 == 0:
+            kernel_size += 1
+        
+        self.sample_rate = sample_rate
+        self.kernel_size = kernel_size
+        self.out_channels = out_channels
+        self.min_low_hz = min_low_hz
+        self.min_band_hz = min_band_hz
+
+        # Initialize filter cutoffs (Mel-scale initialization)
+        num_filters = out_channels
+        low_hz = 30
+        high_hz = self.sample_rate / 2 - (min_low_hz + min_band_hz)
+
+        mel = np.linspace(self.to_mel(low_hz), self.to_mel(high_hz), num_filters + 1)
+        hz = self.to_hz(mel)
+
+        self.low_hz_ = nn.Parameter(torch.from_numpy(hz[:-1]).float().view(-1, 1))
+        self.band_hz_ = nn.Parameter(torch.from_numpy(np.diff(hz)).float().view(-1, 1))
+
+        # Hamming window (full length)
+        # Using built-in hamming window is safer
+        self.register_buffer('window_', torch.hamming_window(self.kernel_size, periodic=False).view(1, -1))
+
+        # Time axis
+        n = (self.kernel_size - 1) / 2.0
+        self.register_buffer('n_', (torch.arange(-n, n + 1).view(1, -1) / self.sample_rate))
+
+    def forward(self, waveforms):
+        self.n_ = self.n_.to(waveforms.device)
+        self.window_ = self.window_.to(waveforms.device)
+
+        low = self.min_low_hz + torch.abs(self.low_hz_)
+        high = torch.clamp(low + self.min_band_hz + torch.abs(self.band_hz_), self.min_low_hz, self.sample_rate / 2)
+        band = (high - low) / self.sample_rate
+
+        f_times_t_low = torch.matmul(low, self.n_)
+        f_times_t_high = torch.matmul(high, self.n_)
+
+        # Handle numerical instability at n=0
+        mid = self.kernel_size // 2
+        
+        # Avoid division by zero
+        safe_n = self.n_.clone()
+        safe_n[0, mid] = 1e-12
+
+        # n is (1, kernel_size), low/high is (out_channels, 1)
+        # result is (out_channels, kernel_size)
+        filters_low = torch.sin(2 * math.pi * f_times_t_low) / (math.pi * safe_n)
+        filters_high = torch.sin(2 * math.pi * f_times_t_high) / (math.pi * safe_n)
+        
+        # Correct at t=0
+        filters_low[:, mid] = 2 * low.squeeze(-1)
+        filters_high[:, mid] = 2 * high.squeeze(-1)
+
+        filters = (filters_high - filters_low) * self.window_
+        # Normalize
+        filters = filters / (filters.norm(p=2, dim=1, keepdim=True) + 1e-12)
+
+        return F.conv1d(waveforms, filters.view(self.out_channels, 1, self.kernel_size))
+
+
+class RawFrontend(nn.Module):
+    def __init__(self, out_channels=128, kernel_size=251, sample_rate=16000):
+        super(RawFrontend, self).__init__()
+        self.pre_emphasis = PreEmphasis(0.97)
+        self.sinc_conv = SincConv(out_channels, kernel_size, sample_rate)
+        # Typical AASIST frontend pooling
+        self.pool = nn.MaxPool1d(kernel_size=3, stride=3)
+        self.batch_norm = nn.BatchNorm1d(out_channels)
+
+    def forward(self, x):
+        # x: (B, 1, samples)
+        x = self.pre_emphasis(x)
+        x = self.sinc_conv(x)
+        x = torch.abs(x) # Amplitude envelope
+        x = self.pool(x)
+        x = self.batch_norm(x)
+        return x # (B, 128, T')
+
+
+
+
 class AudioProcessor:
 
     def __init__(self, sample_rate: int = 16000, max_length_seconds: float = 4.0):
@@ -143,9 +247,23 @@ class AudioProcessor:
             audio = audio[start_idx:start_idx + length]
         elif current_length < length:
             pad_amount = length - current_length
-            audio = torch.nn.functional.pad(audio, (0, pad_amount), mode='constant', value=0)
-
         return audio
+
+    def process(self, audio: torch.Tensor) -> torch.Tensor:
+        """Process raw audio for AASIST3_Raw model (Raw Waveform)."""
+        audio = self.pad_or_crop(audio)
+        
+        # 1. Pre-emphasis (consistent with frontend)
+        pre_emph = PreEmphasis(0.97).to(audio.device)
+        audio = audio.unsqueeze(0).unsqueeze(0) # (1, 1, samples)
+        audio = pre_emph(audio)
+        
+        # 2. Normalization
+        mean = audio.mean()
+        std = audio.std() + 1e-9
+        audio = (audio - mean) / std
+        
+        return audio.squeeze(0) # (1, samples)
 
     def create_sliding_windows(self, audio: torch.Tensor, window_seconds: float = 4.0, overlap_seconds: float = 2.0) -> torch.Tensor:
         window_samples = int(self.sample_rate * window_seconds)
@@ -195,47 +313,37 @@ class SpecAugment(nn.Module):
         augmented_mel = mel.clone()
 
         for _ in range(self.n_masks):
-            f = np.random.randint(0, self.freq_mask_param)
-            f0 = np.random.randint(0, c - f)
-            augmented_mel[f0:f0 + f, :] = 0
+            if self.freq_mask_param > 0:
+                f = np.random.randint(0, self.freq_mask_param)
+                if c - f > 0:
+                    f0 = np.random.randint(0, c - f)
+                    augmented_mel[f0:f0 + f, :] = 0
 
-            tm = np.random.randint(0, self.time_mask_param)
-            t0 = np.random.randint(0, t - tm)
-            augmented_mel[:, t0:t0 + tm] = 0
+            if self.time_mask_param > 0:
+                tm = np.random.randint(0, self.time_mask_param)
+                if t - tm > 0:
+                    t0 = np.random.randint(0, t - tm)
+                    augmented_mel[:, t0:t0 + tm] = 0
 
         return augmented_mel
 
 
-class ASV5MelDataset(torch.utils.data.Dataset):
+class RawASV5Dataset(torch.utils.data.Dataset):
     """
-    Dataset class for ASVspoof5 Mel Spectrograms.
-    Expects mel spectrograms in .npy format with shape (128, time).
+    Dataset class for ASVspoof5 Raw Waveforms.
+    Loads .flac files on the fly and returns raw waveform tensors.
     """
-    def __init__(self, mel_dir, protocol_file, max_len=200, normalize=True, is_train=False):
-        self.mel_dir = Path(mel_dir)
+    def __init__(self, audio_dir, protocol_file, max_len=64000, is_train=False):
+        self.audio_dir = Path(audio_dir)
         self.max_len = max_len
-        self.normalize = normalize
         self.is_train = is_train
-        self.spec_augment = SpecAugment() if is_train else None
+        self.processor = AudioProcessor(sample_rate=16000, max_length_seconds=max_len/16000)
         
         print(f"Loading protocol: {protocol_file}")
         df = pd.read_csv(protocol_file, sep=' ', header=None)
         
         self.file_ids = df[1].values
         self.labels = df[8].apply(lambda x: 1 if x == 'spoof' else 0).values
-
-    def __len__(self):
-        return len(self.file_ids)
-
-    def _pad_or_truncate(self, mel):
-        time_len = mel.shape[1]
-        if time_len < self.max_len:
-            pad_len = self.max_len - time_len
-            mel = np.pad(mel, ((0, 0), (0, pad_len)), mode='constant')
-        elif time_len > self.max_len:
-            start = (time_len - self.max_len) // 2
-            mel = mel[:, start:start + self.max_len]
-        return mel
 
     def get_class_weights(self):
         """Automatically calculate class weights for balancing."""
@@ -247,36 +355,40 @@ class ASV5MelDataset(torch.utils.data.Dataset):
         w_spoof = total / (2 * count_1)
         return [w_bonafide, w_spoof]
 
+    def __len__(self):
+        return len(self.file_ids)
+
     def __getitem__(self, idx):
         file_id = self.file_ids[idx]
         label = self.labels[idx]
-        file_path = self.mel_dir / f"{file_id}.npy"
+        file_path = self.audio_dir / f"{file_id}.flac"
+        
         try:
-            mel = np.load(file_path)
-            mel = self._pad_or_truncate(mel)
+            waveform, _ = self.processor.load_audio(str(file_path))
+            waveform = self.processor.pad_or_crop(waveform, self.max_len)
             
-            num_bins = mel.shape[0]
-            freq_tilt = np.linspace(0.5, 1.5, num_bins).reshape(-1, 1)
-            mel = mel * freq_tilt
-
-            mel_tensor = torch.from_numpy(mel).float()
+            waveform = waveform.unsqueeze(0) # (1, samples)
             
+            # Simple raw-domain augmentation
             if self.is_train:
-                mel_tensor = self.spec_augment(mel_tensor)
+                if random.random() < 0.3:
+                    # Random gain
+                    waveform = waveform * random.uniform(0.8, 1.2)
+                if random.random() < 0.2:
+                    # Small additive noise
+                    noise = torch.randn_like(waveform) * 0.001
+                    waveform = waveform + noise
 
-            if self.normalize:
-                mean = mel_tensor.mean()
-                std = mel_tensor.std() + 1e-9
-                mel_tensor = (mel_tensor - mean) / std
-                
-            return mel_tensor, torch.tensor(label).long()
-        except:
-            return torch.zeros((128, self.max_len)), torch.tensor(label).long()
+            return waveform, torch.tensor(label).long()
+        except Exception as e:
+            # Fallback for missing files during large dataset downloads
+            return torch.zeros((1, self.max_len)), torch.tensor(label).long()
+
 
 
 class PositionalEmbedding(nn.Module):
 
-    def __init__(self, d_model: int, max_len: int = 5000, temprature: int = 10000):
+    def __init__(self, d_model: int, max_len: int = 5000, temperature: int = 10000):
         super(PositionalEmbedding, self).__init__()
 
         self.d_model = d_model
@@ -284,7 +396,7 @@ class PositionalEmbedding(nn.Module):
         pe = torch.zeros(max_len, d_model)
         position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
 
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(temprature) / d_model))
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(temperature) / d_model))
 
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
@@ -460,7 +572,7 @@ class AASIST3Encoder(nn.Module):
     
     def __init__(
         self,
-        in_channels=70,
+        in_channels=128,
         channels=[128, 128, 256, 256, 256, 256],
         output_dim=256
     ):
@@ -479,7 +591,7 @@ class AASIST3Encoder(nn.Module):
         )
         
         for i in range(1, 6):
-            stride = 3 if i in [1, 3, 5] else 1  
+            stride = 2 if i in [1, 3, 5] else 1  
             self.blocks.append(
                 ResidualBlock(
                     channels[i-1],
@@ -503,16 +615,17 @@ class AASIST3Encoder(nn.Module):
         return x
 
 
-class AASIST3_Mel(nn.Module):
+class AASIST3_Raw(nn.Module):
     """
-    AASIST3 Model adapted for Mel Spectrogram input.
+    AASIST3 Model Architecture for Raw Waveform input.
+    Operates end-to-end with a learnable SincNet frontend.
     """
     def __init__(
         self,
-        in_channels=128,
+        frontend_out_channels=128,
         encoder_channels=[128, 128, 256, 256, 256, 256],
-        num_temporal_nodes=100,
-        num_spatial_nodes=100,
+        num_temporal_nodes=50,
+        num_spatial_nodes=50,
         temporal_dim=64,
         spatial_dim=64,
         stack_dim=128,
@@ -521,10 +634,12 @@ class AASIST3_Mel(nn.Module):
         temperature=1.0,
         num_classes=2
     ):
-        super(AASIST3_Mel, self).__init__()
+        super(AASIST3_Raw, self).__init__()
+        
+        self.frontend = RawFrontend(out_channels=frontend_out_channels)
         
         self.encoder = AASIST3Encoder(
-            in_channels=in_channels,
+            in_channels=frontend_out_channels,
             channels=encoder_channels
         )
         
@@ -557,7 +672,9 @@ class AASIST3_Mel(nn.Module):
         )
 
     def forward(self, x):
-        features = self.encoder(x)
+        # x: (B, 1, samples)
+        features = self.frontend(x) # (B, 128, T')
+        features = self.encoder(features) # (B, 256, T'')
         h_t, h_s = self.graph_formation(features)
         hidden = self.backbone(h_t, h_s)
         logits = self.output_head(hidden)
@@ -572,7 +689,7 @@ class KAN_GAL(nn.Module):
         self.in_dim = in_dim
         self.out_dim = out_dim
         self.num_nodes = num_nodes
-        self.temprature = temperature
+        self.temperature = temperature
 
         self.dropout = nn.Dropout(dropout)
         self.kan_attention = KANLayer(in_dim, in_dim)
@@ -580,15 +697,20 @@ class KAN_GAL(nn.Module):
         nn.init.xavier_uniform_(self.W_att)
         self.kan_attn_proj = KANLayer(in_dim, out_dim)
         self.kan_direct_proj = KANLayer(in_dim, out_dim)
+        self.norm_in = nn.LayerNorm(in_dim)
+        self.norm_product = nn.LayerNorm(in_dim)
+        self.scaling = math.sqrt(in_dim)
         self.batch_norm = nn.BatchNorm1d(out_dim)
     
     def forward(self, h):
         batch_size, num_nodes, in_dim = h.shape
+        h = self.norm_in(h)
         h = self.dropout(h)
         h_expanded_i = h.unsqueeze(2)
         h_expanded_j = h.unsqueeze(1)
 
         node_products = h_expanded_i * h_expanded_j
+        node_products = self.norm_product(node_products)
         node_products_flat = node_products.reshape(-1, self.in_dim)
         kan_out = self.kan_attention(node_products_flat)
         kan_out = kan_out.view(batch_size, num_nodes, num_nodes, self.in_dim)
@@ -596,7 +718,7 @@ class KAN_GAL(nn.Module):
         
         attention_scores = torch.einsum('bnmd,dk->bnmk', kan_out, self.W_att)
         attention_scores = attention_scores.mean(dim=-1)
-        attention_map = F.softmax(attention_scores / self.temprature, dim=-1)
+        attention_map = F.softmax(attention_scores / (self.scaling * self.temperature), dim=-1)
         
         h_attended = torch.bmm(attention_map, h)
         h_attended_flat = h_attended.reshape(-1, self.in_dim)
@@ -670,11 +792,20 @@ class KAN_HS_GAL(nn.Module):
         self.kan_hetero_update1 = KANLayer(self.hetero_dim, self.hetero_dim)
         self.kan_hetero_update2 = KANLayer(self.hetero_dim, self.hetero_dim)
         
+        self.norm_t = nn.LayerNorm(temporal_dim)
+        self.norm_s = nn.LayerNorm(spatial_dim)
+        self.norm_st = nn.LayerNorm(self.hetero_dim)
+        self.norm_product = nn.LayerNorm(self.hetero_dim)
+        self.scaling = math.sqrt(self.hetero_dim)
+
         self.batch_norm = nn.BatchNorm1d(self.hetero_dim)
     
     def forward(self, h_t, h_s, S):
         batch_size, num_nodes, _ = h_t.shape
         
+        h_t = self.norm_t(h_t)
+        h_s = self.norm_s(h_s)
+
         h_t_proj = self.kan_temporal_proj(h_t.reshape(-1, self.temporal_dim))
         h_t_proj = h_t_proj.view(batch_size, num_nodes, self.temporal_dim)
         
@@ -682,12 +813,14 @@ class KAN_HS_GAL(nn.Module):
         h_s_proj = h_s_proj.view(batch_size, num_nodes, self.spatial_dim)
         
         h_st = torch.cat([h_t_proj, h_s_proj], dim=-1)
+        h_st = self.norm_st(h_st)
         h_st = self.dropout(h_st)
         
         h_st_i = h_st.unsqueeze(2)
         h_st_j = h_st.unsqueeze(1)
         node_products = h_st_i * h_st_j
         
+        node_products = self.norm_product(node_products)
         node_products_flat = node_products.reshape(-1, self.hetero_dim)
         primary_attn_flat = self.kan_primary_attn(node_products_flat)
         primary_attn = primary_attn_flat.view(batch_size, num_nodes, num_nodes, self.hetero_dim)
@@ -707,7 +840,7 @@ class KAN_HS_GAL(nn.Module):
         W_map[is_TS] = self.W12
         
         B = (A * W_map.unsqueeze(0)).sum(dim=-1)
-        B_hat = F.softmax(B / self.temperature, dim=-1)
+        B_hat = F.softmax(B / (self.scaling * self.temperature), dim=-1)
         
         S_expanded = S.unsqueeze(1).expand(-1, num_nodes, -1)
         S_padded = F.pad(S_expanded, (0, self.hetero_dim - self.stack_dim))
@@ -719,7 +852,7 @@ class KAN_HS_GAL(nn.Module):
         stack_attn = torch.tanh(stack_attn)
         
         stack_scores = torch.matmul(stack_attn, self.W_m).squeeze(-1)
-        A_m = F.softmax(stack_scores / self.temperature, dim=-1)
+        A_m = F.softmax(stack_scores / (self.scaling * self.temperature), dim=-1)
         h_st_weighted = (h_st * A_m.unsqueeze(-1)).sum(dim=1)
         
         S_update1 = self.kan_stack_update1(h_st_weighted)
@@ -795,24 +928,30 @@ class GraphFormation(nn.Module):
         return temporal_features
 
     def _spatial_max_pooling(self, x):
-        batch_size, channels, time = x.shape
+        # x is (B, C, T)
         x_abs = torch.abs(x)
-        x_transposed = x_abs.transpose(1,2)
-        pooled = F.adaptive_max_pool1d(x_transposed.transpose(1,2), self.num_spatial_nodes)
-        spatial_features = pooled.transpose(1,2)
+        x_transposed = x_abs.transpose(1, 2) # (B, T, C)
+        # Pool across channels (C) to get num_spatial_nodes nodes
+        pooled = F.adaptive_max_pool1d(x_transposed, self.num_spatial_nodes) # (B, T, N_s)
+        spatial_features = pooled.transpose(1, 2) # (B, N_s, T)
         return spatial_features
 
-    
     def forward(self, encoder_output):
         batch_size = encoder_output.size(0)
 
-        temporal_features = self._temporal_max_pooling(encoder_output)
+        # 1. Temporal Graph: Nodes defined by time regions
+        temporal_features = self._temporal_max_pooling(encoder_output) # (B, N_t, C)
         temporal_features = self.temporal_projection(temporal_features)
         temporal_features = self.pe_temporal(temporal_features)
         temporal_graph = self.kan_gal_temporal(temporal_features)
         h_t = self.kan_pool_temporal(temporal_graph, k=self.pooled_temporal_nodes)
         
-        spatial_features = self._spatial_max_pooling(encoder_output)
+        # 2. Spatial Graph: Nodes defined by spectral bands (channels)
+        spatial_features = self._spatial_max_pooling(encoder_output) # (B, N_s, T)
+        # Ensure 'time' dimension matches Linear layer input by pooling features to encoder_dim
+        # (This handles variable sequence lengths gracefully)
+        spatial_features = F.adaptive_max_pool1d(spatial_features, self.encoder_dim) # (B, N_s, C)
+        
         spatial_features = self.spatial_projection(spatial_features)
         spatial_features = self.pe_spatial(spatial_features)
         spatial_graph = self.kan_gal_spatial(spatial_features)
@@ -1032,7 +1171,7 @@ class AASSIT3MultiTaskOutput(nn.Module):
 
 
 class FocalLoss(nn.Module):
-    def __init__(self, alpha=0.25, gamma=2.0, reduction='mean'):
+    def __init__(self, alpha=None, gamma=2.0, reduction='mean'):
         super(FocalLoss, self).__init__()
         self.alpha = alpha
         self.gamma = gamma
@@ -1041,7 +1180,14 @@ class FocalLoss(nn.Module):
     def forward(self, inputs, targets):
         ce_loss = F.cross_entropy(inputs, targets, reduction='none')
         pt = torch.exp(-ce_loss)
-        focal_loss = self.alpha * (1 - pt) ** self.gamma * ce_loss
+        
+        if self.alpha is not None:
+            # Handle alpha as a vector/tensor for class balancing
+            # Ensure alpha is on the correct device
+            alpha_t = self.alpha.to(inputs.device).gather(0, targets.data)
+            focal_loss = alpha_t * (1 - pt) ** self.gamma * ce_loss
+        else:
+            focal_loss = (1 - pt) ** self.gamma * ce_loss
         
         if self.reduction == 'mean':
             return focal_loss.mean()
@@ -1072,7 +1218,7 @@ class CombinedLoss(nn.Module):
         else:
             self.class_weights = None
         
-        self.focal_loss = FocalLoss(alpha=focal_alpha, gamma=focal_gamma)
+        self.focal_loss = FocalLoss(alpha=self.class_weights, gamma=focal_gamma)
     
     def forward(self, inputs, targets):
         ce_loss = F.cross_entropy(inputs, targets, weight=self.class_weights, label_smoothing=self.label_smoothing)
@@ -1121,11 +1267,11 @@ class MetricsCalculation:
         accuracy = MetricsCalculation.compute_accuracy(labels, predictions)
         
         # Class-specific accuracies
-        bonafide_mask = (labels == 1)
-        spoof_mask = (labels == 0)
+        spoof_mask = (labels == 1)
+        bonafide_mask = (labels == 0)
         
-        bonafide_acc = 100 * (predictions[bonafide_mask] == labels[bonafide_mask]).sum() / (bonafide_mask.sum() + 1e-8)
         spoof_acc = 100 * (predictions[spoof_mask] == labels[spoof_mask]).sum() / (spoof_mask.sum() + 1e-8)
+        bonafide_acc = 100 * (predictions[bonafide_mask] == labels[bonafide_mask]).sum() / (bonafide_mask.sum() + 1e-8)
         
         tp = ((predictions == 1) & (labels == 1)).sum()
         fp = ((predictions == 1) & (labels == 0)).sum()
@@ -1265,12 +1411,12 @@ class TrainAASIST3:
                 preds = logits.argmax(dim=1)
                 total_samples += labels.size(0)
                 
-                bonafide_mask = (labels == 1)
-                spoof_mask = (labels == 0)
-                total_bonafide_correct += (preds[bonafide_mask] == labels[bonafide_mask]).sum().item()
-                total_bonafide += bonafide_mask.sum().item()
+                spoof_mask = (labels == 1)
+                bonafide_mask = (labels == 0)
                 total_spoof_correct += (preds[spoof_mask] == labels[spoof_mask]).sum().item()
                 total_spoof += spoof_mask.sum().item()
+                total_bonafide_correct += (preds[bonafide_mask] == labels[bonafide_mask]).sum().item()
+                total_bonafide += bonafide_mask.sum().item()
                 
                 total_correct = total_bonafide_correct + total_spoof_correct
                 current_acc = 100 * total_correct / total_samples
@@ -1735,10 +1881,10 @@ class AASIST3Inference:
     
     def predict_file(self, audio_path, return_score=True):
 
-        audio = self.processor.load_audio(audio_path)
-        audio = self.processor.process(audio)
+        audio, _ = self.processor.load_audio(audio_path)
+        audio = self.processor.process(audio) # Returns (1, samples)
         
-        audio = audio.unsqueeze(0).to(self.device)
+        audio = audio.unsqueeze(0).to(self.device) # (1, 1, samples)
         
         with torch.no_grad():
             logits = self.model(audio)
@@ -1776,37 +1922,35 @@ class AASIST3Inference:
         return np.mean(scores)
 
 
-def run_mel_training():
+def run_raw_training():
     import argparse
     from torch.utils.data import DataLoader
     
-    parser = argparse.ArgumentParser(description="AASIST3 Mel Training")
-    parser.add_argument("--train_mel_dir", type=str, default=r"N:\ASV5\mel_train\flac_T")
+    parser = argparse.ArgumentParser(description="AASIST3 Raw Waveform Training")
+    parser.add_argument("--train_audio_dir", type=str, default=r"N:\ASV5\train\flac_T")
     parser.add_argument("--train_protocol", type=str, default=r"N:\ASV5\ASVspoof5.train.tsv")
-    parser.add_argument("--dev_mel_dir", type=str, default=r"N:\ASV5\mel_dev\flac_D")
+    parser.add_argument("--dev_audio_dir", type=str, default=r"N:\ASV5\dev\flac_D")
     parser.add_argument("--dev_protocol", type=str, default=r"N:\ASV5\ASVspoof5.dev.track_1.tsv")
     default_results = r"N:\ASV5"
     parser.add_argument("--checkpoint_dir", type=str, default=default_results,
                         help="Root results directory. Outputs go to <dir>/<experiment_name>/. "
                              f"Default: {default_results}")
-    parser.add_argument("--experiment_name", type=str, default="aasist3_lite_v1")
+    parser.add_argument("--experiment_name", type=str, default="aasist3_raw_v1")
     parser.add_argument("--epochs", type=int, default=30,
-                        help="Total number of epochs to train (end epoch, inclusive).")
+                        help="Total number of epochs to train.")
     parser.add_argument("--start_epoch", type=int, default=0,
-                        help="Epoch to start/resume training from (0-indexed). Normally auto-set by --resume.")
+                        help="Epoch to start/resume training from.")
     parser.add_argument("--resume", type=str, default=None,
-                        help="Path to a .pth checkpoint to resume training from. "
-                             "E.g. --resume AASIST3_Epoch3.pth")
+                        help="Path to a .pth checkpoint to resume training from.")
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-5)
-    parser.add_argument("--max_len", type=int, default=200)
+    parser.add_argument("--max_len", type=int, default=64000, help="4 seconds of audio (16kHz)")
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--patience", type=int, default=10)
     parser.add_argument("--subset", type=int, default=None)
     parser.add_argument("--accumulation_steps", type=int, default=4)
     parser.add_argument("--disable_amp", action="store_true")
-    parser.add_argument("--weight_decay", type=float, default=0.0001,
-                        help="Weight decay for AdamW. Default: 1e-4. (Override after load: 5e-4 recommended)")
+    parser.add_argument("--weight_decay", type=float, default=0.0005)
 
     args = parser.parse_args()
 
@@ -1816,8 +1960,8 @@ def run_mel_training():
     print(f"Using device: {device}")
 
     print("Loading datasets...")
-    train_dataset = ASV5MelDataset(args.train_mel_dir, args.train_protocol, max_len=args.max_len, is_train=True)
-    dev_dataset = ASV5MelDataset(args.dev_mel_dir, args.dev_protocol, max_len=args.max_len, is_train=False)
+    train_dataset = RawASV5Dataset(args.train_audio_dir, args.train_protocol, max_len=args.max_len, is_train=True)
+    dev_dataset = RawASV5Dataset(args.dev_audio_dir, args.dev_protocol, max_len=args.max_len, is_train=False)
     
     # Calculate class weights for balancer
     weights = train_dataset.get_class_weights()
@@ -1834,8 +1978,8 @@ def run_mel_training():
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True)
     dev_loader = DataLoader(dev_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
 
-    print("Initializing AASIST3_Mel model...")
-    model = AASIST3_Mel(in_channels=128).to(device)
+    print("Initializing AASIST3_Raw model...")
+    model = AASIST3_Raw(frontend_out_channels=128).to(device)
     
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
@@ -1848,7 +1992,7 @@ def run_mel_training():
 
     metadata = print_training_summary(args, model, criterion, device, optimizer)
     
-    print_model_summary(model, device, input_size=(1, 128, args.max_len))
+    print_model_summary(model, device, input_size=(1, 1, args.max_len))
     torch.cuda.empty_cache()
 
     trainer = TrainAASIST3(
@@ -1890,4 +2034,4 @@ def run_mel_training():
         raise e
 
 if __name__ == "__main__":
-    run_mel_training()
+    run_raw_training()
