@@ -30,8 +30,8 @@ A deep learning pipeline for detecting AI-generated (fake) speech using **Linear
 
 | Metric | WaveFake (Test) |
 |--------|:--------------:|
-| Accuracy | 99.84% |
-| AUC | 0.9996 |
+| Accuracy | ~99.84% |
+| AUC | ~0.9996 |
 | EER | 0.3817% |
 
 ### Leave One Out Evaluation
@@ -49,8 +49,8 @@ A deep learning pipeline for detecting AI-generated (fake) speech using **Linear
 ### ASVspoof2019 Evaluation (Cross Dataset)
 | Metric   | Value  |
 | -------- | ------ |
-| Accuracy | 82.68% |
-| AUC      | 0.7891 |
+| Accuracy | ~82.68% |
+| AUC      | ~0.7891 |
 | EER      | 24.35% |
 
 > Partial generalizability observed on ASVspoof 2019 LA — the model performs near-perfectly in-domain but shows expected degradation on an unseen spoofing benchmark.
