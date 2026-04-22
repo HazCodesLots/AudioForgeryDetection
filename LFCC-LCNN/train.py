@@ -21,7 +21,7 @@ class LFCCLCNNTrainer:
         class_weights=None
     ):
         self.model = model.to(device)
-        self.lfcc_extractor = lfcc_extractor.to(device)
+        self.lfcc_extractor = lfcc_extractor # Fixed: Stay on CPU for DataLoader workers
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.device = device
@@ -81,7 +81,8 @@ class LFCCLCNNTrainer:
         
         return avg_loss, accuracy
     
-    def validate(self, desc='Validation'):
+    def validate(self, desc='Validation', loader=None):
+        loader = loader or self.val_loader
         self.model.eval()
         total_loss = 0
         all_preds = []
@@ -89,7 +90,7 @@ class LFCCLCNNTrainer:
         all_labels = []
         
         with torch.no_grad():
-            for lfcc, labels in tqdm(self.val_loader, desc=desc):
+            for lfcc, labels in tqdm(loader, desc=desc):
                 lfcc = lfcc.to(self.device)
                 labels = labels.to(self.device)
                 
@@ -105,13 +106,13 @@ class LFCCLCNNTrainer:
                 all_scores.extend(probs[:, 1].cpu().numpy())
                 all_labels.extend(labels.cpu().numpy())
         
-        avg_loss = total_loss / len(self.val_loader)
+        avg_loss = total_loss / len(loader)
         accuracy = accuracy_score(all_labels, all_preds)
         auc = roc_auc_score(all_labels, all_scores)
         
         eer = self.calculate_eer(all_labels, all_scores)
         
-        return avg_loss, accuracy, auc, eer
+        return avg_loss, accuracy, auc, eer, all_labels, all_scores
     
     def calculate_eer(self, labels, scores):
         """Calculate Equal Error Rate"""
@@ -204,7 +205,7 @@ class LFCCLCNNTrainer:
                 T_max=num_epochs,
                 eta_min=1e-6
             )
-            print(f" Using Cosine Annealing LR: {self.optimizer.param_groups[0]['lr']:.6f} → 1e-6")
+            print(f" Using Cosine Annealing LR: {self.optimizer.param_groups[0]['lr']:.6f} -> 1e-6")
         elif scheduler_type == 'plateau':
             self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
                 self.optimizer,
@@ -237,7 +238,7 @@ class LFCCLCNNTrainer:
             train_loss, train_acc = self.train_epoch(grad_clip=grad_clip)
             print(f"Train Loss: {train_loss:.6f} | Train Acc: {train_acc*100:.2f}%")
             
-            val_loss, val_acc, val_auc, val_eer = self.validate()
+            val_loss, val_acc, val_auc, val_eer, _, _ = self.validate()
             print(f"Val Loss: {val_loss:.6f} | Val Acc: {val_acc*100:.2f}% | "
                   f"Val AUC: {val_auc:.6f} | Val EER: {val_eer:.4f}%")
             

@@ -16,18 +16,9 @@ from datetime import datetime
 from typing import Tuple, Optional
 import random
 import gc
-try:
-    import torchaudio
-except ImportError:
-    torchaudio = None
-except OSError:
-    torchaudio = None
 import pandas as pd
 from pathlib import Path
-try:
-    from transformers import Wav2Vec2Model
-except ImportError:
-    Wav2Vec2Model = None
+import librosa
 
 
 
@@ -43,7 +34,6 @@ class KANLayer(nn.Module):
         self.out_features = out_features
         self.grid_size = grid_size
         self.spline_order = spline_order
-
         self.base_activation = base_activation()
         self.base_weight = nn.Parameter(torch.empty(out_features, in_features))
         nn.init.kaiming_uniform_(self.base_weight, a=math.sqrt(5))
@@ -54,43 +44,68 @@ class KANLayer(nn.Module):
         grid = torch.linspace(grid_range[0], grid_range[1], grid_size + 1).unsqueeze(0)
         h = (grid_range[1] - grid_range[0]) / grid_size
         extended_grid = torch.cat([
-            grid[:, 0:1] - h * torch.arange(spline_order, 0, -1).unsqueeze(0),
+            grid[:, 0:1] - h * torch.arange(spline_order, 0, -1).unsqueeze(0).float(),
             grid,
-            grid[:, -1:] + h * torch.arange(1, spline_order + 1).unsqueeze(0)
+            grid[:, -1:] + h * torch.arange(1, spline_order + 1).unsqueeze(0).float()
         ], dim=1)
         self.register_buffer("grid", extended_grid)
         
         self.spline_coeffs = nn.Parameter(
             torch.randn(out_features, in_features, grid_size + spline_order) * 0.001
         )
+        self.dropout = nn.Dropout(0.1)
 
     def b_splines(self, x: torch.Tensor):
-        assert x.dim() >= 1 and x.size(-1) == self.in_features
+        """
+        Compute B-spline basis functions with proper shape handling.
+        x: (batch, in_features)
+        Returns: (batch, in_features, num_basis)
+        """
+        assert x.dim() == 2 and x.size(-1) == self.in_features, \
+            f"Expected shape (*, {self.in_features}), got {x.shape}"
         
-        grid = self.grid
-        x = x.unsqueeze(-1)
+        batch_size = x.size(0)
+        grid = self.grid.squeeze(0)  # (num_grid_points)
+        x = x.unsqueeze(-1)  # (batch, in_features, 1)
         
-        bases = ((x >= grid[:, :-1]) & (x < grid[:, 1:])).to(x.dtype)
+        # Compute basis: (batch, in_features, num_intervals)
+        bases = ((x >= grid[:-1]) & (x < grid[1:])).float()
+        
         for k in range(1, self.spline_order + 1):
+            left = grid[:-k-1]
+            right = grid[k:-1]
+            denom_l = (right - left).clamp(min=1e-8)
+            
+            right_k = grid[k+1:]
+            left_k = grid[1:-k]
+            denom_r = (right_k - left_k).clamp(min=1e-8)
+            
             bases = (
-                (x - grid[:, : -(k + 1)])
-                / (grid[:, k:-1] - grid[:, : -(k + 1)])
-                * bases[:, :, :-1]
+                (x - left) / denom_l * bases[..., :-1]
             ) + (
-                (grid[:, k + 1 :] - x)
-                / (grid[:, k + 1 :] - grid[:, 1:-k])
-                * bases[:, :, 1:]
+                (grid[k+1:] - x) / denom_r * bases[..., 1:]
             )
+        
         return bases.contiguous()
 
     def forward(self, x: torch.Tensor):
+        """
+        Forward pass for KAN layer.
+        x: (batch, in_features)
+        Returns: (batch, out_features)
+        """
+        if x.dim() != 2:
+            raise ValueError(f"Expected 2D input, got {x.dim()}D: {x.shape}")
         
+        x = torch.tanh(x)
+        x = self.dropout(x)
         base_output = F.linear(self.base_activation(x), self.base_weight)
         
-        bases = self.b_splines(x) 
+        bases = self.b_splines(x)
         
-        scaled_coeffs = self.spline_coeffs * self.spline_weight.unsqueeze(-1)
-        spline_output = torch.einsum("...jk,ijk->...i", bases, scaled_coeffs)
+        scaled_coeffs = self.spline_coeffs.clamp(-5.0, 5.0) * self.spline_weight.unsqueeze(-1)
+        
+        spline_output = torch.einsum("bij,oij->bo", bases, scaled_coeffs)
         
         return base_output + spline_output
 
@@ -100,21 +115,25 @@ class PreEmphasis(nn.Module):
     def __init__(self, coef=0.97):
         super(PreEmphasis, self).__init__()
         self.coef = coef
-        self.register_buffer('flipped_filter', torch.FloatTensor([-self.coef, 1.0]).unsqueeze(0).unsqueeze(0))
+        # Create filter: [-coef, 1.0] shape (1, 1, 2) for conv1d
+        self.register_buffer('flipped_filter', 
+            torch.tensor([-self.coef, 1.0]).view(1, 1, 2).float())
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Apply pre-emphasis filter.
+        x: (B, 1, T) after frontend receives it
+        """
+        # Ensure 3D: (B, 1, T)
         if x.dim() == 2:
             x = x.unsqueeze(1)
-            squeeze_output = True
-        else:
-            squeeze_output = False
-
+        
+        # Pad at the beginning for causal filtering
         x_padded = torch.nn.functional.pad(x, (1, 0), mode='replicate')
+        
+        # Apply conv1d: (B, 1, T+1) -> (B, 1, T)
         x_preemphasized = torch.nn.functional.conv1d(x_padded, self.flipped_filter)
-
-        if squeeze_output:
-            x_preemphasized = x_preemphasized.squeeze(1)
-
+        
         return x_preemphasized
 
 
@@ -143,7 +162,6 @@ class SincConv(nn.Module):
         self.min_low_hz = min_low_hz
         self.min_band_hz = min_band_hz
 
-        # Initialize filter cutoffs (Mel-scale initialization)
         num_filters = out_channels
         low_hz = 30
         high_hz = self.sample_rate / 2 - (min_low_hz + min_band_hz)
@@ -154,44 +172,35 @@ class SincConv(nn.Module):
         self.low_hz_ = nn.Parameter(torch.from_numpy(hz[:-1]).float().view(-1, 1))
         self.band_hz_ = nn.Parameter(torch.from_numpy(np.diff(hz)).float().view(-1, 1))
 
-        # Hamming window (full length)
-        # Using built-in hamming window is safer
         self.register_buffer('window_', torch.hamming_window(self.kernel_size, periodic=False).view(1, -1))
 
-        # Time axis
         n = (self.kernel_size - 1) / 2.0
         self.register_buffer('n_', (torch.arange(-n, n + 1).view(1, -1) / self.sample_rate))
 
     def forward(self, waveforms):
-        self.n_ = self.n_.to(waveforms.device)
-        self.window_ = self.window_.to(waveforms.device)
-
         low = self.min_low_hz + torch.abs(self.low_hz_)
-        high = torch.clamp(low + self.min_band_hz + torch.abs(self.band_hz_), self.min_low_hz, self.sample_rate / 2)
-        band = (high - low) / self.sample_rate
+        high = torch.clamp(
+            low + self.min_band_hz + torch.abs(self.band_hz_),
+            self.min_low_hz,
+            self.sample_rate / 2 - 1.0
+        )
 
         f_times_t_low = torch.matmul(low, self.n_)
         f_times_t_high = torch.matmul(high, self.n_)
 
-        # Handle numerical instability at n=0
         mid = self.kernel_size // 2
-        
-        # Avoid division by zero
-        safe_n = self.n_.clone()
-        safe_n[0, mid] = 1e-12
+        n_safe = self.n_.abs().clamp(min=1.0 / self.sample_rate)
 
-        # n is (1, kernel_size), low/high is (out_channels, 1)
-        # result is (out_channels, kernel_size)
-        filters_low = torch.sin(2 * math.pi * f_times_t_low) / (math.pi * safe_n)
-        filters_high = torch.sin(2 * math.pi * f_times_t_high) / (math.pi * safe_n)
-        
-        # Correct at t=0
-        filters_low[:, mid] = 2 * low.squeeze(-1)
-        filters_high[:, mid] = 2 * high.squeeze(-1)
+        filters_low = torch.sin(2 * math.pi * f_times_t_low) / (math.pi * n_safe)
+        filters_high = torch.sin(2 * math.pi * f_times_t_high) / (math.pi * n_safe)
+
+        filters_low[:, mid] = 2.0 * low.squeeze(-1) / self.sample_rate
+        filters_high[:, mid] = 2.0 * high.squeeze(-1) / self.sample_rate
 
         filters = (filters_high - filters_low) * self.window_
-        # Normalize
-        filters = filters / (filters.norm(p=2, dim=1, keepdim=True) + 1e-12)
+
+        norms = filters.norm(p=2, dim=1, keepdim=True).clamp(min=1e-8)
+        filters = filters / norms
 
         return F.conv1d(waveforms, filters.view(self.out_channels, 1, self.kernel_size))
 
@@ -201,7 +210,6 @@ class RawFrontend(nn.Module):
         super(RawFrontend, self).__init__()
         self.pre_emphasis = PreEmphasis(0.97)
         self.sinc_conv = SincConv(out_channels, kernel_size, sample_rate)
-        # Typical AASIST frontend pooling
         self.pool = nn.MaxPool1d(kernel_size=3, stride=3)
         self.batch_norm = nn.BatchNorm1d(out_channels)
 
@@ -209,12 +217,10 @@ class RawFrontend(nn.Module):
         # x: (B, 1, samples)
         x = self.pre_emphasis(x)
         x = self.sinc_conv(x)
-        x = torch.abs(x) # Amplitude envelope
+        x = torch.abs(x)
         x = self.pool(x)
         x = self.batch_norm(x)
         return x # (B, 128, T')
-
-
 
 
 class AudioProcessor:
@@ -225,16 +231,23 @@ class AudioProcessor:
         self.max_length_samples = int(sample_rate * max_length_seconds)
 
     def load_audio(self, audio_path: str) -> Tuple[torch.Tensor, int]:
-        waveform, sr = torchaudio.load(audio_path)
-
-        if waveform.shape[0] != 1:
-            waveform = torch.mean(waveform, dim=0, keepdim=True)
-
-        if sr != self.sample_rate:
-            resampler = torchaudio.transforms.Resample(sr, self.sample_rate)
-            waveform = resampler(waveform)
-
-        return waveform.squeeze(0), self.sample_rate
+        """Load audio file using librosa instead of torchaudio."""
+        if librosa is None:
+            raise RuntimeError(
+                "librosa is required for audio loading. "
+                "Install with: pip install librosa soundfile"
+            )
+        
+        try:
+            # Load audio using librosa
+            waveform, sr = librosa.load(audio_path, sr=self.sample_rate, mono=True)
+            
+            # Convert numpy array to torch tensor
+            waveform = torch.from_numpy(waveform).float()
+            
+            return waveform, self.sample_rate
+        except Exception as e:
+            raise RuntimeError(f"Failed to load audio from {audio_path}: {str(e)}")
 
     def pad_or_crop(self, audio: torch.Tensor, length: Optional[int] = None) -> torch.Tensor:
         if length is None:
@@ -247,23 +260,25 @@ class AudioProcessor:
             audio = audio[start_idx:start_idx + length]
         elif current_length < length:
             pad_amount = length - current_length
+            audio = torch.nn.functional.pad(audio, (0, pad_amount))
         return audio
 
     def process(self, audio: torch.Tensor) -> torch.Tensor:
-        """Process raw audio for AASIST3_Raw model (Raw Waveform)."""
+        """Pad, crop, and normalize raw audio for AASIST3_Raw.
+
+        NOTE: Do NOT apply pre-emphasis here. The RawFrontend inside the model
+        already handles this as its first step. Applying it twice over-filters
+        the signal and causes gradient explosions in SincConv.
+        """
+        # 1. Pad/crop to fixed length
         audio = self.pad_or_crop(audio)
-        
-        # 1. Pre-emphasis (consistent with frontend)
-        pre_emph = PreEmphasis(0.97).to(audio.device)
-        audio = audio.unsqueeze(0).unsqueeze(0) # (1, 1, samples)
-        audio = pre_emph(audio)
-        
-        # 2. Normalization
+
+        # 2. Instance normalization (zero mean, unit variance)
         mean = audio.mean()
-        std = audio.std() + 1e-9
+        std = torch.clamp(audio.std(), min=1e-5)
         audio = (audio - mean) / std
-        
-        return audio.squeeze(0) # (1, samples)
+
+        return audio.unsqueeze(0)  # (1, samples)
 
     def create_sliding_windows(self, audio: torch.Tensor, window_seconds: float = 4.0, overlap_seconds: float = 2.0) -> torch.Tensor:
         window_samples = int(self.sample_rate * window_seconds)
@@ -285,7 +300,6 @@ class AudioProcessor:
             end = start + window_samples
 
             if end > audio_length:
-
                 window = audio[start:]
                 window = torch.nn.functional.pad(window, (0, window_samples - window.shape[0]), mode='constant', value=0)
             else:
@@ -296,44 +310,12 @@ class AudioProcessor:
         return torch.stack(windows)
 
 
-class SpecAugment(nn.Module):
-    """
-    SpecAugment implementation for Mel Spectrograms:
-    - Frequency Masking: masks whole mel bins
-    - Time Masking: masks whole time segments
-    """
-    def __init__(self, freq_mask_param=15, time_mask_param=35, n_masks=2):
-        super(SpecAugment, self).__init__()
-        self.freq_mask_param = freq_mask_param
-        self.time_mask_param = time_mask_param
-        self.n_masks = n_masks
-
-    def forward(self, mel):
-        c, t = mel.shape
-        augmented_mel = mel.clone()
-
-        for _ in range(self.n_masks):
-            if self.freq_mask_param > 0:
-                f = np.random.randint(0, self.freq_mask_param)
-                if c - f > 0:
-                    f0 = np.random.randint(0, c - f)
-                    augmented_mel[f0:f0 + f, :] = 0
-
-            if self.time_mask_param > 0:
-                tm = np.random.randint(0, self.time_mask_param)
-                if t - tm > 0:
-                    t0 = np.random.randint(0, t - tm)
-                    augmented_mel[:, t0:t0 + tm] = 0
-
-        return augmented_mel
-
-
 class RawASV5Dataset(torch.utils.data.Dataset):
     """
     Dataset class for ASVspoof5 Raw Waveforms.
     Loads .flac files on the fly and returns raw waveform tensors.
     """
-    def __init__(self, audio_dir, protocol_file, max_len=64000, is_train=False):
+    def __init__(self, audio_dir, protocol_file, max_len=64600, is_train=False):
         self.audio_dir = Path(audio_dir)
         self.max_len = max_len
         self.is_train = is_train
@@ -341,9 +323,31 @@ class RawASV5Dataset(torch.utils.data.Dataset):
         
         print(f"Loading protocol: {protocol_file}")
         df = pd.read_csv(protocol_file, sep=' ', header=None)
+        print(f"Protocol shape: {df.shape}")
+        print(f"First row: {df.iloc[0].tolist() if len(df) > 0 else 'Empty'}")
         
         self.file_ids = df[1].values
-        self.labels = df[8].apply(lambda x: 1 if x == 'spoof' else 0).values
+        
+        # Detect label column (usually column 6 or 8)
+        label_col = None
+        for col in [8, 6, 7]:
+            if col in df.columns:
+                try:
+                    test_val = df[col].iloc[0]
+                    if test_val in ['spoof', 'bonafide', '-']:
+                        label_col = col
+                        print(f"Detected label column: {col} (value: {test_val})")
+                        break
+                except:
+                    continue
+        
+        if label_col is None:
+            raise ValueError(f"Could not find label column in protocol. Columns: {df.columns.tolist()}")
+        
+        # Map labels: spoof=1, bonafide=0, -=0 (unknown treated as bonafide)
+        self.labels = df[label_col].apply(
+            lambda x: 1 if x == 'spoof' else 0
+        ).values
 
     def get_class_weights(self):
         """Automatically calculate class weights for balancing."""
@@ -351,8 +355,8 @@ class RawASV5Dataset(torch.utils.data.Dataset):
         count_1 = np.sum(self.labels == 1) # Spoof
         total = count_0 + count_1
         
-        w_bonafide = total / (2 * count_0)
-        w_spoof = total / (2 * count_1)
+        w_bonafide = total / (2 * count_0) if count_0 > 0 else 1.0
+        w_spoof = total / (2 * count_1) if count_1 > 0 else 1.0
         return [w_bonafide, w_spoof]
 
     def __len__(self):
@@ -365,23 +369,51 @@ class RawASV5Dataset(torch.utils.data.Dataset):
         
         try:
             waveform, _ = self.processor.load_audio(str(file_path))
-            waveform = self.processor.pad_or_crop(waveform, self.max_len)
-            
-            waveform = waveform.unsqueeze(0) # (1, samples)
-            
-            # Simple raw-domain augmentation
             if self.is_train:
+                # Random time stretching
                 if random.random() < 0.3:
-                    # Random gain
-                    waveform = waveform * random.uniform(0.8, 1.2)
-                if random.random() < 0.2:
-                    # Small additive noise
-                    noise = torch.randn_like(waveform) * 0.001
-                    waveform = waveform + noise
+                    rate = random.uniform(0.95, 1.05)
+                    waveform_np = waveform.numpy()
+                    waveform_np = librosa.effects.time_stretch(waveform_np, rate=rate)
+                    # Ensure same length
+                    if waveform_np.shape[-1] > self.max_len:
+                        waveform_np = waveform_np[..., :self.max_len]
+                    elif waveform_np.shape[-1] < self.max_len:
+                        waveform_np = np.pad(waveform_np, (0, self.max_len - waveform_np.shape[-1]))
+                    waveform = torch.from_numpy(waveform_np).float()
 
+                # Random gain with larger range
+                if random.random() < 0.5:
+                    gain = random.uniform(0.7, 1.3)
+                    waveform = waveform * gain
+                    waveform = torch.clamp(waveform, -1.0, 1.0)  # Prevent clipping artifacts
+                
+                # Larger additive noise
+                if random.random() < 0.4:
+                    noise = torch.randn_like(waveform) * random.uniform(0.001, 0.005)
+                    waveform = waveform + noise
+                
+                # Spec-style noise bursts (random silence regions)
+                if random.random() < 0.2:
+                    num_bursts = random.randint(1, 3)
+                    for _ in range(num_bursts):
+                        v_len = waveform.shape[-1]
+                        if v_len > 4000:
+                            burst_start = random.randint(0, v_len - 4000)
+                            burst_len = random.randint(1000, 4000)
+                            if burst_start + burst_len <= v_len:
+                                waveform[burst_start:burst_start + burst_len] *= random.uniform(0.0, 0.3)
+
+            waveform = self.processor.process(waveform)  # (1, samples)
+
+            if waveform.shape[-1] > self.max_len:
+                waveform = waveform[..., :self.max_len]
+            elif waveform.shape[-1] < self.max_len:
+                waveform = F.pad(waveform, (0, self.max_len - waveform.shape[-1]))
             return waveform, torch.tensor(label).long()
+
         except Exception as e:
-            # Fallback for missing files during large dataset downloads
+            print(f"Warning: Failed to load {file_path}: {e}")
             return torch.zeros((1, self.max_len)), torch.tensor(label).long()
 
 
@@ -414,40 +446,6 @@ class PositionalEmbedding(nn.Module):
         else:
             raise ValueError(f"Expected 2D or 3D input, got {x.dim()}D")
 
-
-class Wav2Vec2Frontend(nn.Module):
-
-    def __init__(self, model_name='facebook/wav2vec2-xls-r-300m', output_dim=768, freeze_encoder=False, use_conv_projection=True):
-        super(Wav2Vec2Frontend, self).__init__()
-
-        self.wav2vec2 = Wav2Vec2Model.from_pretrained(model_name)
-        self.hidden_dim = self.wav2vec2.config.hidden_size
-
-        if freeze_encoder:
-            for param in self.wav2vec2.parameters():
-                param.requires_grad = False
-
-        self.use_conv_projection = use_conv_projection
-        if use_conv_projection:
-            self.projection = nn.Conv1d(self.hidden_dim, output_dim, kernel_size=1, bias=True)
-        else:
-            self.projection = nn.Linear(self.hidden_dim, output_dim)
-        self.output_dim = output_dim
-
-    def forward(self, x):
-        if x.dim() == 3:
-            x = x.squeeze(1)
-
-        outputs = self.wav2vec2(x, output_hidden_states=False)
-        features = outputs.last_hidden_state
-
-        if self.use_conv_projection:
-            features = features.transpose(1, 2)
-            features = self.projection(features)
-        else:
-            features = self.projection(features)
-            features = features.transpose(1,2)
-        return features
 
 
 class ConvUnit(nn.Module):
@@ -624,8 +622,8 @@ class AASIST3_Raw(nn.Module):
         self,
         frontend_out_channels=128,
         encoder_channels=[128, 128, 256, 256, 256, 256],
-        num_temporal_nodes=50,
-        num_spatial_nodes=50,
+        num_temporal_nodes=25,
+        num_spatial_nodes=25,
         temporal_dim=64,
         spatial_dim=64,
         stack_dim=128,
@@ -668,7 +666,9 @@ class AASIST3_Raw(nn.Module):
         
         self.output_head = AASIST3OutputHead(
             hidden_dim=self.backbone.hidden_dim,
-            num_classes=num_classes
+            num_classes=num_classes,
+            use_intermediate=True,
+            intermediate_dim=128
         )
 
     def forward(self, x):
@@ -706,8 +706,9 @@ class KAN_GAL(nn.Module):
         batch_size, num_nodes, in_dim = h.shape
         h = self.norm_in(h)
         h = self.dropout(h)
-        h_expanded_i = h.unsqueeze(2)
-        h_expanded_j = h.unsqueeze(1)
+        h_normed = F.normalize(h, p=2, dim=-1)
+        h_expanded_i = h_normed.unsqueeze(2)
+        h_expanded_j = h_normed.unsqueeze(1)
 
         node_products = h_expanded_i * h_expanded_j
         node_products = self.norm_product(node_products)
@@ -760,12 +761,13 @@ class KAN_GraphPool(nn.Module):
         return h_pooled
 
 class KAN_HS_GAL(nn.Module):
-    def __init__(self, temporal_dim, spatial_dim, num_nodes, stack_dim, temperature=1.0, dropout=0.2):
+    def __init__(self, temporal_dim, spatial_dim, num_temporal_nodes, num_spatial_nodes, stack_dim, temperature=1.0, dropout=0.2):
         super(KAN_HS_GAL, self).__init__()
 
         self.temporal_dim = temporal_dim
         self.spatial_dim = spatial_dim
-        self.num_nodes = num_nodes
+        self.num_temporal_nodes = num_temporal_nodes
+        self.num_spatial_nodes = num_spatial_nodes
         self.stack_dim = stack_dim
         self.hetero_dim = temporal_dim + spatial_dim
         self.temperature = temperature
@@ -801,38 +803,47 @@ class KAN_HS_GAL(nn.Module):
         self.batch_norm = nn.BatchNorm1d(self.hetero_dim)
     
     def forward(self, h_t, h_s, S):
-        batch_size, num_nodes, _ = h_t.shape
+        batch_size = h_t.size(0)
+        num_t = h_t.size(1)
+        num_s = h_s.size(1)
         
         h_t = self.norm_t(h_t)
         h_s = self.norm_s(h_s)
 
         h_t_proj = self.kan_temporal_proj(h_t.reshape(-1, self.temporal_dim))
-        h_t_proj = h_t_proj.view(batch_size, num_nodes, self.temporal_dim)
+        h_t_proj = h_t_proj.view(batch_size, num_t, self.temporal_dim)
         
         h_s_proj = self.kan_spatial_proj(h_s.reshape(-1, self.spatial_dim))
-        h_s_proj = h_s_proj.view(batch_size, num_nodes, self.spatial_dim)
+        h_s_proj = h_s_proj.view(batch_size, num_s, self.spatial_dim)
         
-        h_st = torch.cat([h_t_proj, h_s_proj], dim=-1)
+        h_t_proj_padded = F.pad(h_t_proj, (0, self.spatial_dim))
+        h_s_proj_padded = F.pad(h_s_proj, (self.temporal_dim, 0))
+        
+        h_st = torch.cat([h_t_proj_padded, h_s_proj_padded], dim=1)  # (B, num_t + num_s, hetero_dim)
+        total_nodes = num_t + num_s
+        
         h_st = self.norm_st(h_st)
         h_st = self.dropout(h_st)
-        
-        h_st_i = h_st.unsqueeze(2)
-        h_st_j = h_st.unsqueeze(1)
-        node_products = h_st_i * h_st_j
+        h_st_normed = F.normalize(h_st, p=2, dim=-1)
+        h_st_i = h_st_normed.unsqueeze(2)
+        h_st_j = h_st_normed.unsqueeze(1)
+        node_products = h_st_i * h_st_j  # (B, total_nodes, total_nodes, hetero_dim)
         
         node_products = self.norm_product(node_products)
         node_products_flat = node_products.reshape(-1, self.hetero_dim)
         primary_attn_flat = self.kan_primary_attn(node_products_flat)
-        primary_attn = primary_attn_flat.view(batch_size, num_nodes, num_nodes, self.hetero_dim)
+        primary_attn = primary_attn_flat.view(batch_size, total_nodes, total_nodes, self.hetero_dim)
         A = torch.tanh(primary_attn)
         
-        idx = torch.arange(num_nodes, device=h_st.device)
-        is_temporal = idx < (num_nodes // 2)
-        is_temporal = is_temporal.unsqueeze(0).expand(num_nodes, -1)
+        # Create weight map based on temporal/spatial node types
+        idx = torch.arange(total_nodes, device=h_st.device)
+        is_temporal = idx < num_t
+        is_temporal_2d = is_temporal.unsqueeze(0).expand(total_nodes, -1)
         
-        W_map = torch.zeros(num_nodes, num_nodes, self.hetero_dim, device=h_st.device)
-        is_TT = is_temporal & is_temporal.t()
-        is_SS = (~is_temporal) & (~is_temporal.t())
+        W_map = torch.zeros(total_nodes, total_nodes, self.hetero_dim, 
+                           device=h_st.device, dtype=h_st.dtype)
+        is_TT = is_temporal_2d & is_temporal_2d.t()
+        is_SS = (~is_temporal_2d) & (~is_temporal_2d.t())
         is_TS = ~(is_TT | is_SS)
         
         W_map[is_TT] = self.W11
@@ -842,16 +853,16 @@ class KAN_HS_GAL(nn.Module):
         B = (A * W_map.unsqueeze(0)).sum(dim=-1)
         B_hat = F.softmax(B / (self.scaling * self.temperature), dim=-1)
         
-        S_expanded = S.unsqueeze(1).expand(-1, num_nodes, -1)
+        S_expanded = S.unsqueeze(1).expand(-1, total_nodes, -1)
         S_padded = F.pad(S_expanded, (0, self.hetero_dim - self.stack_dim))
         
         h_st_stack = h_st * S_padded
         h_st_stack_flat = h_st_stack.reshape(-1, self.hetero_dim)
         stack_attn_flat = self.kan_stack_attn(h_st_stack_flat)
-        stack_attn = stack_attn_flat.view(batch_size, num_nodes, self.hetero_dim)
+        stack_attn = stack_attn_flat.view(batch_size, total_nodes, self.hetero_dim)
         stack_attn = torch.tanh(stack_attn)
         
-        stack_scores = torch.matmul(stack_attn, self.W_m).squeeze(-1)
+        stack_scores = torch.matmul(stack_attn, self.W_m).squeeze(-1)  # (B, total_nodes)
         A_m = F.softmax(stack_scores / (self.scaling * self.temperature), dim=-1)
         h_st_weighted = (h_st * A_m.unsqueeze(-1)).sum(dim=1)
         
@@ -863,19 +874,19 @@ class KAN_HS_GAL(nn.Module):
         
         h_st_update1_flat = h_st_attended.reshape(-1, self.hetero_dim)
         h_st_update1 = self.kan_hetero_update1(h_st_update1_flat)
-        h_st_update1 = h_st_update1.view(batch_size, num_nodes, self.hetero_dim)
+        h_st_update1 = h_st_update1.view(batch_size, total_nodes, self.hetero_dim)
         
         h_st_update2_flat = h_st.reshape(-1, self.hetero_dim)
         h_st_update2 = self.kan_hetero_update2(h_st_update2_flat)
-        h_st_update2 = h_st_update2.view(batch_size, num_nodes, self.hetero_dim)
+        h_st_update2 = h_st_update2.view(batch_size, total_nodes, self.hetero_dim)
         
         h_st_new = h_st_update1 + h_st_update2
         h_st_new = h_st_new.transpose(1, 2)
         h_st_new = self.batch_norm(h_st_new)
         h_st_new = h_st_new.transpose(1, 2)
         
-        h_t_new = h_st_new[:, :, :self.temporal_dim]
-        h_s_new = h_st_new[:, :, self.temporal_dim:]
+        h_t_new = h_st_new[:, :num_t, :self.temporal_dim]
+        h_s_new = h_st_new[:, num_t:, self.temporal_dim:]
         
         return h_t_new, h_s_new, S_new
 
@@ -898,65 +909,117 @@ class GraphPositionalEmbedding(nn.Module):
 
 
 class GraphFormation(nn.Module):
+    """
+    Graph Formation Module for AASIST3.
+    
+    Converts encoder output into two separate graph representations:
+    1. Temporal Graph: Models temporal dependencies (frame-level nodes)
+    2. Spatial Graph: Models spectral dependencies (frequency-band nodes)
+    
+    Flow:
+    encoder_output (B, C, T) 
+        → temporal pooling (B, N_t, C) → projection → temporal graph (B, N_t, temporal_dim)
+        → spatial pooling  (B, N_s, T) → projection → spatial graph  (B, N_s, spatial_dim)
+    """
 
-    def __init__(self, encoder_dim, num_temporal_nodes=50, num_spatial_nodes=50, temporal_dim=64, spatial_dim=64, pool_ratio=0.5, temperature=1.0):
-
+    def __init__(
+        self, 
+        encoder_dim, 
+        num_temporal_nodes=50, 
+        num_spatial_nodes=50, 
+        temporal_dim=64, 
+        spatial_dim=64, 
+        pool_ratio=0.5, 
+        temperature=1.0
+    ):
         super(GraphFormation, self).__init__()
+        
         self.encoder_dim = encoder_dim
         self.num_temporal_nodes = num_temporal_nodes
         self.num_spatial_nodes = num_spatial_nodes
         self.temporal_dim = temporal_dim
         self.spatial_dim = spatial_dim
+        self.pool_ratio = pool_ratio
+        self.temperature = temperature
+        
         self.temporal_projection = nn.Linear(encoder_dim, temporal_dim)
-        self.spatial_projection = nn.Linear(encoder_dim, spatial_dim)
+        self.spatial_pool_size = 32
+        self.spatial_projection = nn.Linear(self.spatial_pool_size, spatial_dim)
         self.pe_temporal = PositionalEmbedding(temporal_dim, num_temporal_nodes)
         self.pe_spatial = PositionalEmbedding(spatial_dim, num_spatial_nodes)
-
-        self.kan_gal_temporal = KAN_GAL(in_dim=temporal_dim, out_dim=temporal_dim, num_nodes=num_temporal_nodes, temperature=temperature)
-        self.kan_gal_spatial = KAN_GAL(in_dim=spatial_dim, out_dim=spatial_dim, num_nodes=num_spatial_nodes, temperature=temperature)
+        
+        self.kan_gal_temporal = KAN_GAL(
+            in_dim=temporal_dim, 
+            out_dim=temporal_dim, 
+            num_nodes=num_temporal_nodes, 
+            temperature=temperature
+        )
+        self.kan_gal_spatial = KAN_GAL(
+            in_dim=spatial_dim, 
+            out_dim=spatial_dim, 
+            num_nodes=num_spatial_nodes, 
+            temperature=temperature
+        )
+        
         self.kan_pool_temporal = KAN_GraphPool(in_dim=temporal_dim, ratio=pool_ratio)
         self.kan_pool_spatial = KAN_GraphPool(in_dim=spatial_dim, ratio=pool_ratio)
-
+        
         self.pooled_temporal_nodes = max(1, int(num_temporal_nodes * pool_ratio))
         self.pooled_spatial_nodes = max(1, int(num_spatial_nodes * pool_ratio))
 
     def _temporal_max_pooling(self, x):
-        batch_size, channels, time = x.shape
-        x_abs = torch.abs(x)
+        """
+        Pool encoder output along time axis to create temporal nodes.
+        
+        Input:  (B, C, T) - encoder output
+        Output: (B, N_t, C) - temporal node features
+        """
+        x_abs = torch.abs(x)  # (B, C, T)
+        
         pooled = F.adaptive_max_pool1d(x_abs, self.num_temporal_nodes)
-        temporal_features = pooled.transpose(1,2)
+        temporal_features = pooled.transpose(1, 2)
         return temporal_features
 
     def _spatial_max_pooling(self, x):
-        # x is (B, C, T)
-        x_abs = torch.abs(x)
-        x_transposed = x_abs.transpose(1, 2) # (B, T, C)
-        # Pool across channels (C) to get num_spatial_nodes nodes
-        pooled = F.adaptive_max_pool1d(x_transposed, self.num_spatial_nodes) # (B, T, N_s)
-        spatial_features = pooled.transpose(1, 2) # (B, N_s, T)
+        """
+        Pool encoder output along channel axis to create spatial nodes.
+        
+        Input:  (B, C, T) - encoder output
+        Output: (B, N_s, T) - spatial node features (one per frequency band)
+        """
+        x_abs = torch.abs(x)  # (B, C, T)
+        
+        x_transposed = x_abs.transpose(1, 2)
+        
+        pooled = F.adaptive_max_pool1d(x_transposed, self.num_spatial_nodes)
+        
+        spatial_features = pooled.transpose(1, 2)
+        
         return spatial_features
 
     def forward(self, encoder_output):
+        """
+        Create temporal and spatial graphs from encoder output.
+        
+        Args:
+            encoder_output: (B, encoder_dim, T) - output from AASIST3Encoder
+            
+        Returns:
+            h_t: (B, pooled_temporal_nodes, temporal_dim) - pooled temporal graph
+            h_s: (B, pooled_spatial_nodes, spatial_dim) - pooled spatial graph
+        """
         batch_size = encoder_output.size(0)
-
-        # 1. Temporal Graph: Nodes defined by time regions
-        temporal_features = self._temporal_max_pooling(encoder_output) # (B, N_t, C)
+        temporal_features = self._temporal_max_pooling(encoder_output)
         temporal_features = self.temporal_projection(temporal_features)
         temporal_features = self.pe_temporal(temporal_features)
         temporal_graph = self.kan_gal_temporal(temporal_features)
         h_t = self.kan_pool_temporal(temporal_graph, k=self.pooled_temporal_nodes)
-        
-        # 2. Spatial Graph: Nodes defined by spectral bands (channels)
-        spatial_features = self._spatial_max_pooling(encoder_output) # (B, N_s, T)
-        # Ensure 'time' dimension matches Linear layer input by pooling features to encoder_dim
-        # (This handles variable sequence lengths gracefully)
-        spatial_features = F.adaptive_max_pool1d(spatial_features, self.encoder_dim) # (B, N_s, C)
-        
+        spatial_features = self._spatial_max_pooling(encoder_output)
+        spatial_features = F.adaptive_max_pool1d(spatial_features, self.spatial_pool_size)
         spatial_features = self.spatial_projection(spatial_features)
         spatial_features = self.pe_spatial(spatial_features)
         spatial_graph = self.kan_gal_spatial(spatial_features)
         h_s = self.kan_pool_spatial(spatial_graph, k=self.pooled_spatial_nodes)
-
         return h_t, h_s
 
 
@@ -968,14 +1031,28 @@ class BranchModule(nn.Module):
         self.pool_ratio = pool_ratio
         self.use_checkpoint = use_checkpoint
 
-        self.hs_gal_1 = KAN_HS_GAL(temporal_dim=temporal_dim, spatial_dim= spatial_dim, num_nodes=max(num_temporal_nodes, num_spatial_nodes), stack_dim=stack_dim, temperature=temperature)
+        self.hs_gal_1 = KAN_HS_GAL(
+            temporal_dim=temporal_dim, 
+            spatial_dim=spatial_dim, 
+            num_temporal_nodes=num_temporal_nodes, 
+            num_spatial_nodes=num_spatial_nodes,
+            stack_dim=stack_dim, 
+            temperature=temperature
+        )
         self.pooled_temporal = KAN_GraphPool(temporal_dim, ratio=pool_ratio)
         self.pooled_spatial = KAN_GraphPool(spatial_dim, ratio=pool_ratio)
 
         self.pooled_temporal_nodes = max(1, int(num_temporal_nodes * pool_ratio))
         self.pooled_spatial_nodes = max(1, int(num_spatial_nodes * pool_ratio))
 
-        self.hs_gal_2 = KAN_HS_GAL(temporal_dim=temporal_dim, spatial_dim=spatial_dim, num_nodes=max(self.pooled_temporal_nodes, self.pooled_spatial_nodes), stack_dim=stack_dim, temperature=temperature)
+        self.hs_gal_2 = KAN_HS_GAL(
+            temporal_dim=temporal_dim, 
+            spatial_dim=spatial_dim, 
+            num_temporal_nodes=self.pooled_temporal_nodes, 
+            num_spatial_nodes=self.pooled_spatial_nodes,
+            stack_dim=stack_dim, 
+            temperature=temperature
+        )
 
     def forward(self, h_t, h_s, S):
         if self.use_checkpoint and h_t.requires_grad:
@@ -1030,7 +1107,6 @@ class MultiBranchArchitecture(nn.Module):
             current_spatial_nodes = branch.pooled_spatial_nodes
 
         self.dropout1 = nn.Dropout(dropout_p1)
-        self.dropout2 = nn.Dropout(dropout_p2)
         self.hidden_dim = 2 * temporal_dim + 2 * spatial_dim + stack_dim
 
     def forward(self, h_t_init, h_s_init):
@@ -1082,10 +1158,6 @@ class MultiBranchArchitecture(nn.Module):
         H_s = torch.stack(spatial_padded, dim=1)
         S_f = torch.stack(stack_outputs, dim=1)
 
-        H_t = self.dropout1(H_t)
-        H_s = self.dropout1(H_s)
-        S_f = self.dropout1(S_f)
-
         H_max_t = H_t.max(dim=1)[0].max(dim=1)[0]
         H_mean_t = H_t.mean(dim=1).mean(dim=1)
 
@@ -1095,8 +1167,7 @@ class MultiBranchArchitecture(nn.Module):
         S_max_f = S_f.max(dim=1)[0]
 
         hidden_features = torch.cat([H_max_t, H_mean_t, H_max_s, H_mean_s, S_max_f], dim=1)
-        hidden_features = self.dropout2(hidden_features)
-
+        hidden_features = self.dropout1(hidden_features)  # p=0.4 once
         return hidden_features
 
 
@@ -1147,9 +1218,9 @@ class AASIST3OutputWithEmbedding(nn.Module):
             return logits
 
 
-class AASSIT3MultiTaskOutput(nn.Module):
+class AASIT3MultiTaskOutput(nn.Module):
     def __init__(self, hidden_dim, num_attack_types=19, use_quality_head=False):
-        super(AASSIT3MultiTaskOutput, self).__init__()
+        super(AASIT3MultiTaskOutput, self).__init__()
 
         self.hidden_dim = hidden_dim
         self.num_attack_types = num_attack_types
@@ -1200,43 +1271,35 @@ class FocalLoss(nn.Module):
 class CombinedLoss(nn.Module):
     def __init__(
         self,
-        class_weights=None,
-        focal_alpha=0.25,
         focal_gamma=2.0,
-        ce_weight=1.0,
-        focal_weight=1.0,
-        label_smoothing=0.1
+        ce_weight=0.5,
+        focal_weight=0.5,
+        label_smoothing=0.05
     ):
         super(CombinedLoss, self).__init__()
-        
         self.ce_weight = ce_weight
         self.focal_weight = focal_weight
         self.label_smoothing = label_smoothing
-        
-        if class_weights is not None:
-            self.register_buffer('class_weights', torch.tensor(class_weights).float())
-        else:
-            self.class_weights = None
-        
-        self.focal_loss = FocalLoss(alpha=self.class_weights, gamma=focal_gamma)
-    
+        self.focal_loss = FocalLoss(alpha=None, gamma=focal_gamma)
+
     def forward(self, inputs, targets):
-        ce_loss = F.cross_entropy(inputs, targets, weight=self.class_weights, label_smoothing=self.label_smoothing)
+        ce_loss = F.cross_entropy(
+            inputs, targets,
+            label_smoothing=self.label_smoothing
+        )
         focal_loss = self.focal_loss(inputs, targets)
-        total_loss = self.ce_weight * ce_loss + self.focal_weight * focal_loss
-        
-        return total_loss
+        return self.ce_weight * ce_loss + self.focal_weight * focal_loss
 
 
 class MetricsCalculation:
     @staticmethod
     def compute_eer(labels, scores):
-
         fpr, tpr, thresholds = roc_curve(labels, scores, pos_label=1)
         fnr = 1 - tpr
         
-        eer_threshold = brentq(lambda x: 1. - x - interp1d(fpr, tpr)(x), 0., 1.)
-        eer = 100 * (1 - interp1d(fpr, tpr)(eer_threshold))
+        roc_interp = interp1d(fpr, tpr)
+        eer_fpr = brentq(lambda x: 1. - x - roc_interp(x), 0., 1.)
+        eer = 100 * (1 - roc_interp(eer_fpr))
         
         idx = np.nanargmin(np.abs(fnr - fpr))
         threshold = thresholds[idx]
@@ -1296,18 +1359,9 @@ class MetricsCalculation:
 
 class TrainAASIST3:
     
-    def __init__(
-        self,
-        model,
-        optimizer,
-        criterion,
-        device='cuda',
-        scheduler=None,
-        checkpoint_dir='checkpoints',
-        experiment_name='aasist3',
-        accumulation_steps=1,
-        use_amp=True
-    ):
+    def __init__(self, model, optimizer, criterion, device, scheduler=None,
+                 checkpoint_dir='.', experiment_name='aasist3',
+                 accumulation_steps=4, use_amp=True, max_grad_norm=1.0):
         self.model = model
         self.optimizer = optimizer
         self.criterion = criterion
@@ -1315,8 +1369,9 @@ class TrainAASIST3:
         self.scheduler = scheduler
         self.accumulation_steps = accumulation_steps
         self.use_amp = use_amp
+        self.max_grad_norm = max_grad_norm
+        self.freeze_frontend_epochs = 0 # Will be updated via property or externally
         self.scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
-        self.scheduler = scheduler
         self.last_val_metrics = None
         self.gap_threshold = 20.0
         self.skipped_steps = 0
@@ -1380,19 +1435,20 @@ class TrainAASIST3:
             if (batch_idx + 1) % self.accumulation_steps == 0 or (batch_idx + 1) == len(train_loader):
                 self.scaler.unscale_(self.optimizer)
                 
-                if self.device == 'cuda':
+                if 'cuda' in str(self.device):
                     torch.cuda.empty_cache()
                 gc.collect()
                 
-                last_grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5).item()
+                last_grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.max_grad_norm).item()
 
                 epoch_grad_norms.append(last_grad_norm)
                 
                 if math.isnan(last_grad_norm) or math.isinf(last_grad_norm):
-                    pass
+                    grad_type = 'NaN' if math.isnan(last_grad_norm) else 'Inf'
+                    print(f"\n[WARNING] {grad_type} gradient at epoch {self.current_epoch+1}, batch {batch_idx+1}.")
                 elif last_grad_norm == 0.0:
-                    print(f"\n[WARNING] Zero gradient detected at epoch {self.current_epoch+1}, batch {batch_idx+1}! Potential vanishing gradient or dead layers.")
-                
+                    print(f"\n[WARNING] Zero gradient at epoch {self.current_epoch+1}, batch {batch_idx+1}.")
+
                 old_scale = self.scaler.get_scale()
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
@@ -1531,6 +1587,23 @@ class TrainAASIST3:
         
         for epoch in range(start_epoch, num_epochs):
             self.current_epoch = epoch
+
+            # Resume safety: ensure frontend is unfrozen if we start past the warmup period
+            if epoch >= self.freeze_frontend_epochs and self.freeze_frontend_epochs > 0:
+                for param in self.model.frontend.parameters():
+                    if not param.requires_grad:
+                        print(f"\n[Frontend] Ensuring SincConv frontend is unfrozen (Epoch {epoch+1} >= Warmup {self.freeze_frontend_epochs})")
+                        param.requires_grad = True
+                        break # Only print once
+                # Re-ensure all params are unfrozen silently
+                for param in self.model.frontend.parameters():
+                    param.requires_grad = True
+
+            # Unfreeze the SincConv frontend after warmup period
+            if epoch == self.freeze_frontend_epochs and self.freeze_frontend_epochs > 0:
+                print(f"\n[Frontend] Unfreezing SincConv frontend at epoch {epoch + 1}. Full end-to-end training begins.")
+                for param in self.model.frontend.parameters():
+                    param.requires_grad = True
             
             train_loss, train_acc, train_bn_acc, train_sp_acc, grad_stats, overfit_stats = self.train_epoch(train_loader)
             
@@ -1719,7 +1792,7 @@ class TrainAASIST3:
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         
-        new_wd = self.training_config.get('weight_decay', 0.0001)
+        new_wd = self.training_config.get('weight_decay', 0.01)
         for group in self.optimizer.param_groups:
             group['weight_decay'] = new_wd
         
@@ -1738,14 +1811,6 @@ class TrainAASIST3:
     
     def save_history(self):
         """Save run-level training history + best results to Results/<experiment>/Metrics/."""
-        summary = {
-            'experiment': self.experiment_name,
-            'completed_at': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            'best_eer': float(self.best_eer),
-            'best_min_dcf': float(self.best_min_dcf),
-            'epochs_trained': int(len(self.history['train_loss'])),
-            'history': self.history,
-        }
         history_path = os.path.join(self.metrics_dir, 'training_metrics.json')
         full_report = {
             "metadata": self.training_config,
@@ -1764,14 +1829,16 @@ class TrainAASIST3:
 
 def count_parameters(model):
     """Count trainable parameters in model."""
-    total = sum(p.numel() for p in model.parameters())
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total, trainable = 0, 0
+    for p in model.parameters():
+        total += p.numel()
+        if p.requires_grad:
+            trainable += p.numel()
     return {
         'total': total,
         'trainable': trainable,
         'frozen': total - trainable
     }
-
 
 def print_training_summary(args, model, criterion, device, optimizer):
     """Print training configuration and model summary."""
@@ -1844,7 +1911,7 @@ def print_training_summary(args, model, criterion, device, optimizer):
     }
     return metadata
 
-def print_model_summary(model, device, input_size=(1, 128, 200)):
+def print_model_summary(model, device, input_size=(1, 1, 64600)):
     print("MODEL FORWARD TEST")
     model.eval()
     with torch.no_grad():
@@ -1903,12 +1970,12 @@ class AASIST3Inference:
         overlap=32000
     ):
 
-        audio = self.processor.load_audio(audio_path)
+        audio, _ = self.processor.load_audio(audio_path)
         
         scores = []
         stride = window_size - overlap
         
-        for start in range(0, len(audio) - window_size + 1, stride):
+        for start in range(0, audio.shape[-1] - window_size + 1, stride):
 
             window = audio[start:start + window_size]
             window = self.processor.process(window)
@@ -1946,16 +2013,23 @@ def run_raw_training():
                         help="Epoch to start/resume training from.")
     parser.add_argument("--resume", type=str, default=None,
                         help="Path to a .pth checkpoint to resume training from.")
-    parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--lr", type=float, default=1e-5)
-    parser.add_argument("--max_len", type=int, default=64000, help="4 seconds of audio (16kHz)")
+    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--max_len", type=int, default=64600, help="~4s audio at 16kHz (ASVspoof standard: 64600 samples)")
     parser.add_argument("--num_workers", type=int, default=0)
-    parser.add_argument("--patience", type=int, default=10)
+    parser.add_argument("--patience", type=int, default=15)
     parser.add_argument("--subset", type=int, default=None)
-    parser.add_argument("--accumulation_steps", type=int, default=4)
+    parser.add_argument("--accumulation_steps", type=int, default=2)
     parser.add_argument("--disable_amp", action="store_true")
-    parser.add_argument("--weight_decay", type=float, default=0.0005)
-
+    parser.add_argument("--weight_decay", type=float, default=0.05)
+    parser.add_argument("--max_grad_norm", type=float, default=1.0,
+                        help="Max gradient norm for clipping. Default: 1.0")
+    parser.add_argument("--freeze_frontend_epochs", type=int, default=2,
+                        help="Freeze SincConv frontend for first N epochs to stabilize encoder training.")
+    parser.add_argument("--use_ce_loss", action="store_true",
+                        help="Use plain CrossEntropyLoss instead of CombinedLoss (FocalLoss).")
+    parser.add_argument("--ce_pos_weight", type=float, default=3.0,
+                        help="Pos weight for bonafide class in CrossEntropyLoss.")
     args = parser.parse_args()
 
     resume_epoch = 0
@@ -1967,9 +2041,8 @@ def run_raw_training():
     train_dataset = RawASV5Dataset(args.train_audio_dir, args.train_protocol, max_len=args.max_len, is_train=True)
     dev_dataset = RawASV5Dataset(args.dev_audio_dir, args.dev_protocol, max_len=args.max_len, is_train=False)
     
-    # Calculate class weights for balancer
-    weights = train_dataset.get_class_weights()
-    print(f"Computed Class Weights: Bonafide={weights[0]:.2f}, Spoof={weights[1]:.2f}")
+    bonafide_w, spoof_w = train_dataset.get_class_weights()
+    print(f"[Info] Class imbalance — Bonafide weight: {bonafide_w:.2f}, Spoof weight: {spoof_w:.2f}")
 
     if args.subset:
         train_indices = torch.randperm(len(train_dataset))[:args.subset]
@@ -1984,18 +2057,27 @@ def run_raw_training():
 
     print("Initializing AASIST3_Raw model...")
     model = AASIST3_Raw(frontend_out_channels=128).to(device)
+
+    # Freeze the SincConv frontend for the first N epochs
+    if args.freeze_frontend_epochs > 0:
+        print(f"Freezing SincConv frontend for first {args.freeze_frontend_epochs} epochs...")
+        for param in model.frontend.parameters():
+            param.requires_grad = False
     
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
-    criterion = CombinedLoss(class_weights=weights, label_smoothing=0.1).to(device)
+    if args.use_ce_loss:
+        ce_weight = torch.tensor([args.ce_pos_weight, 1.0]).to(device)
+        criterion = nn.CrossEntropyLoss(weight=ce_weight, label_smoothing=0.05)
+        print(f"Using CrossEntropyLoss with weights [bonafide={args.ce_pos_weight:.1f}, spoof=1.0]")
+    else:
+        # Fallback to combined loss
+        criterion = CombinedLoss(class_weights=[bonafide_w, spoof_w], label_smoothing=0.05).to(device)
+        print("Using CombinedLoss (FocalLoss + CE)")
     
-    warmup_epochs = 2
-    warmup_scheduler = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_epochs)
-    main_scheduler = CosineAnnealingLR(optimizer, T_max=100)
-    scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, main_scheduler], milestones=[warmup_epochs])
+    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
 
     metadata = print_training_summary(args, model, criterion, device, optimizer)
-    
     print_model_summary(model, device, input_size=(1, 1, args.max_len))
     torch.cuda.empty_cache()
 
@@ -2008,10 +2090,11 @@ def run_raw_training():
         checkpoint_dir=args.checkpoint_dir,
         experiment_name=args.experiment_name,
         accumulation_steps=args.accumulation_steps,
-        use_amp=not args.disable_amp
+        use_amp=not args.disable_amp,
+        max_grad_norm=args.max_grad_norm
     )
     trainer.training_config = metadata
-
+    trainer.freeze_frontend_epochs = args.freeze_frontend_epochs
     if args.resume:
         resume_epoch = trainer.load_checkpoint(args.resume)
         print(f"  Will resume from epoch {resume_epoch + 1} → {args.epochs}")

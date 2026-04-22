@@ -32,7 +32,8 @@ def scenario_c_multi_vocoder(splits_json, device='cuda'):
         splits_json=splits_json,
         vocoders_train=None,  # All vocoders
         vocoders_test=None,   # All vocoders
-        batch_size=64
+        batch_size=64,
+        balance_test=True
     )
     
     # Verify 80/20 split
@@ -59,25 +60,22 @@ def scenario_c_multi_vocoder(splits_json, device='cuda'):
     print(f"Test  - Real: {test_dataset.real_count}, Fake: {test_dataset.fake_count}")
     print("="*70 + "\n")
     
-    # Initialize model
     model = LCNN(n_lfcc=60, num_classes=2)
     lfcc_extractor = LFCCExtractor(n_lfcc=60, n_filter=60)
     
-    # Load pre-trained weights
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    weight_path = os.path.join(script_dir, 'weights', 'epoch_075.pt')
+    weight_path = os.path.join(script_dir, 'weights', 'protocol', 'id_baseline', 'id_baseline_best.pt')
     
     if not os.path.exists(weight_path):
         raise FileNotFoundError(f"Pre-trained weights not found at {weight_path}. Train the model first.")
     
     print(f"Loading weights from {weight_path}...")
-    checkpoint = torch.load(weight_path, map_location=device)
+    checkpoint = torch.load(weight_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint['model_state_dict'])
     lfcc_extractor.load_state_dict(checkpoint['lfcc_extractor_state_dict'])
     print(f" Checkpoint loaded - Epoch: {checkpoint.get('epoch', 'Unknown') + 1}, "
           f"Previous EER: {checkpoint.get('val_eer', 'Unknown'):.4f}%")
     
-    # Evaluate
     trainer = LFCCLCNNTrainer(
         model=model,
         lfcc_extractor=lfcc_extractor,
@@ -87,7 +85,7 @@ def scenario_c_multi_vocoder(splits_json, device='cuda'):
         lr=0.0001
     )
     
-    _, acc, auc, eer = trainer.validate(desc='Evaluating')
+    _, acc, auc, eer, _, _ = trainer.validate(desc='Evaluating')
     
     print("SCENARIO C RESULTS: ALL-VOCODERS EVALUATION")
     print(f"Test Accuracy: {acc*100:.2f}%")

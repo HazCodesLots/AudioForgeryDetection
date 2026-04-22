@@ -1,10 +1,12 @@
 """
 Diagnose WaveFake split integrity using the current WaveFakeDatasetFixed API.
 Checks for overlap between train and test sets across all vocoders and real data.
+Includes 7 LJSpeech vocoder verification and JSUT/CommonVoice exclusion checks.
 """
 
 import json
 import os
+import random
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
 splits_json = os.path.join(script_dir, 'wavefake_splits.json')
@@ -15,8 +17,39 @@ with open(splits_json, 'r') as f:
 
 print(f"Metadata: {splits.get('metadata', 'NO METADATA')}\n")
 
+LJ_VOCODERS = [
+    "ljspeech_melgan", 
+    "ljspeech_melgan_large", 
+    "ljspeech_full_band_melgan", 
+    "ljspeech_multi_band_melgan", 
+    "ljspeech_hifiGAN", 
+    "ljspeech_parallel_wavegan", 
+    "ljspeech_waveglow"
+]
 
-print("1. INTRA-CATEGORY OVERLAP CHECK (train ∩ test per category)")
+print("0. ARCHITECTURE INTEGRITY CHECK")
+present_vocoders = list(splits['vocoders'].keys())
+missing_lj = [v for v in LJ_VOCODERS if v not in present_vocoders]
+
+if missing_lj:
+    print(f"  WARNING: Missing {len(missing_lj)} LJSpeech vocoders: {missing_lj}")
+else:
+    print(f"  [OK] All {len(LJ_VOCODERS)} LJSpeech vocoders present.")
+
+jsut_confound = [v for v in present_vocoders if v.startswith('jsut_') or v.startswith('common_voices')]
+print(f"  Info: Detected {len(jsut_confound)} non-LJ vocoders (JSUT/CommonVoices): {jsut_confound}")
+
+# Check for cross-contamination in paths
+for voc in LJ_VOCODERS:
+    if voc in splits['vocoders']:
+        all_paths = splits['vocoders'][voc]['train'] + splits['vocoders'][voc]['test']
+        jsut_in_lj = [p for p in all_paths if 'jsut' in p.lower() or 'common_voice' in p.lower()]
+        if jsut_in_lj:
+            print(f"  CRITICAL: Found {len(jsut_in_lj)} JSUT/CV paths inside {voc}!")
+        else:
+            pass # Clean
+
+print("\n1. INTRA-CATEGORY OVERLAP CHECK (train INTERSECT test per category)")
 total_overlap = 0
 
 # Real data
@@ -28,6 +61,7 @@ total = len(real_train) + len(real_test)
 ratio = len(real_train) / total
 print(f"  real: train={len(real_train)}, test={len(real_test)}, "
       f"overlap={len(overlap)}, ratio={ratio:.3f}")
+assert abs(ratio - 0.8) < 0.05, f"Real ratio {ratio:.3f} is not 80/20"
 
 # Each vocoder
 for voc_name, voc_data in splits['vocoders'].items():
@@ -39,12 +73,11 @@ for voc_name, voc_data in splits['vocoders'].items():
     ratio = len(train_set) / total
     print(f"  {voc_name}: train={len(train_set)}, test={len(test_set)}, "
           f"overlap={len(overlap)}, ratio={ratio:.3f}")
+    assert abs(ratio - 0.8) < 0.05, f"{voc_name} ratio {ratio:.3f} is not 80/20"
 
 print(f"\n  Total overlapping files: {total_overlap}")
 
-
 print("2. CROSS-CATEGORY CHECK (real files in fake sets?)")
-
 all_real = real_train | real_test
 cross_issues = 0
 for voc_name, voc_data in splits['vocoders'].items():
@@ -57,9 +90,7 @@ for voc_name, voc_data in splits['vocoders'].items():
 if cross_issues == 0:
     print("  No cross-category leakage detected")
 
-
 print("3. CROSS-VOCODER CHECK (file overlap between vocoders?)")
-
 voc_names = list(splits['vocoders'].keys())
 cross_voc_issues = 0
 for i, v1 in enumerate(voc_names):
@@ -69,27 +100,22 @@ for i, v1 in enumerate(voc_names):
             all_v2 = set(splits['vocoders'][v2]['train']) | set(splits['vocoders'][v2]['test'])
             overlap = all_v1 & all_v2
             if overlap:
-                print(f"  {v1} ∩ {v2}: {len(overlap)} shared files!")
+                print(f"  {v1} INTERSECT {v2}: {len(overlap)} shared files!")
                 cross_voc_issues += len(overlap)
 
 if cross_voc_issues == 0:
     print("   No cross-vocoder overlap detected")
 
-
 print("4. PHYSICAL INTEGRITY CHECK (Do files exist on disk?)")
-
-import random
 
 def check_existence(file_list, category_name, num_samples=10):
     if not file_list:
         return 0
-    
     samples = random.sample(file_list, min(len(file_list), num_samples))
     missing = 0
     for f in samples:
         if not os.path.exists(f):
             missing += 1
-    
     if missing > 0:
         print(f"   {category_name}: {missing}/{len(samples)} samples CHECKED MISSING!")
     else:
@@ -109,9 +135,7 @@ if total_missing == 0:
 else:
     print(f"\n   FOUND MISSING FILES! Total missing in samples: {total_missing}")
 
-
 print("5. DATALOADER INTEGRATION TEST")
-
 from WaveFakeLoader import WaveFakeDatasetFixed
 
 try:
@@ -125,7 +149,6 @@ try:
     )
 
     _ = train_ds[0]
-    
     train_paths = set(s['path'] for s in train_ds.samples)
     test_paths = set(s['path'] for s in test_ds.samples)
     loader_overlap = train_paths & test_paths
@@ -135,13 +158,15 @@ try:
     print(f"  File-level overlap:   {len(loader_overlap)}")
 
     total = len(train_ds) + len(test_ds)
-    print(f"  Train ratio: {len(train_ds)/total:.3f}")
+    train_ratio = len(train_ds)/total
+    print(f"  Train ratio: {train_ratio:.3f}")
+    assert abs(train_ratio - 0.8) < 0.05, f"Loader train ratio {train_ratio:.3f} is not 80/20"
     
 except Exception as e:
     print(f"  DataLoader Test Failed: {e}")
     loader_overlap = [1]
 
 if total_overlap == 0 and cross_issues == 0 and cross_voc_issues == 0 and len(loader_overlap) == 0 and total_missing == 0:
-    print(" ALL CHECKS PASSED — No data leakage detected and files exist")
+    print("\n ALL CHECKS PASSED - No data leakage detected and files exist")
 else:
-    print(" ISSUES FOUND — See above for details")
+    print("\n ISSUES FOUND - See above for details")
