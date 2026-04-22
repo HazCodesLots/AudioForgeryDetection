@@ -62,16 +62,6 @@ A deep learning pipeline for detecting AI-generated (fake) speech using **Linear
 | AUC      | ~0.21  |
 | EER      | 79.95% |
 
-
-| Model                        | ITW EER | Notes                                     |
-| ---------------------------- | ------- | ----------------------------------------- |
-| LFCC SpecRNet                | 8.19%   | Trained on diverse data openaccess.thecvf |
-| SSL (Wav2Vec2) + backend     | 4.07%   | Large pretrained model computer           |
-| XLS-R layer fusion           | 6.90%   | Transformer-based isca-archive            |
-| BLDAM (LFCC-based)           | 6.20%   | Multi-dataset training sciencedirect      |
-| Wav2Vec2 (unified framework) | 17.4%   | Cross-corpus zero-shot arxiv              |
-| Your LFCC-LCNN (zero-shot)   | 79.95%  | WaveFake-only training                    |
-
 > Complete generalization collapse on In-The-Wild audio (79.95% EER).
 ---
 
