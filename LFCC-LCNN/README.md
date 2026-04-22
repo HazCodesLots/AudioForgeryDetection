@@ -62,6 +62,17 @@ A deep learning pipeline for detecting AI-generated (fake) speech using **Linear
 | AUC      | ~0.21  |
 | EER      | 79.95% |
 
+| Fold | Model                 | ITW EER (%) |
+| ---- | --------------------- | ----------- |
+| —    | ID Baseline           | 80.63       |
+| 1    | Fold1_MelGAN          | 78.71       |
+| 2    | Fold2_MelGAN_Large    | 79.96       |
+| 3    | Fold3_FB_MelGAN       | 84.05       |
+| 4    | Fold4_MB_MelGAN       | 77.79       |
+| 5    | Fold5_HiFiGAN         | 80.04       |
+| 6    | Fold6_ParallelWaveGAN | 79.16       |
+| —    | Average               | 79.95       |
+
 > Complete generalization collapse on In-The-Wild audio (79.95% EER).
 ---
 
