@@ -21,7 +21,7 @@ A deep learning pipeline for detecting AI-generated (fake) speech using **Linear
 
 ### Multi-Vocoder
 
-**Dataset:** 147,366 samples total — 80/20 split, evaluated at epoch 75 (best).
+**Dataset:** 147,366 samples total — 80/20 split.
 
 | Split | Total | Real | Fake |
 |-------|------:|-----:|-----:|
