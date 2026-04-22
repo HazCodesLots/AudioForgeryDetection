@@ -1,6 +1,6 @@
 # Audio Deepfake Detection — LFCC + LCNN
 
-A deep learning pipeline for detecting AI-generated (fake) speech using **Linear Frequency Cepstral Coefficients (LFCC)** as audio features and a **Light CNN (LCNN)** classifier with Max-Feature-Map (MFM) activations. Trained and evaluated on the **WaveFake** dataset [link](https://arxiv.org/pdf/2203.16263).
+A deep learning pipeline for detecting AI-generated (fake) speech using **Linear Frequency Cepstral Coefficients (LFCC)** as audio features and a **Light CNN (LCNN)** classifier with Max-Feature-Map (MFM) activations. Trained and evaluated on the **WaveFake** dataset [[link]](https://arxiv.org/pdf/2203.16263).
 
 ## Model Architecture
 
