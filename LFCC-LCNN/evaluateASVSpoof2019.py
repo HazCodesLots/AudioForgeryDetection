@@ -111,14 +111,14 @@ def evaluate_asvspoof(model_path, protocol_path, data_path, device='cuda'):
         for waveforms, labels in tqdm(loader):
             waveforms = waveforms.to(device)
             
-            lfcc = lfcc_extractor(waveforms.squeeze(1)) # (batch, n_lfcc, time)
-            lfcc = lfcc.unsqueeze(1) # Add channel dim: (batch, 1, n_lfcc, time)
+            lfcc = lfcc_extractor(waveforms.squeeze(1))
+            lfcc = lfcc.unsqueeze(1)
             
             outputs = model(lfcc)
             probs = F.softmax(outputs, dim=1)
             
             all_labels.extend(labels.numpy())
-            all_scores.extend(probs[:, 1].cpu().numpy()) # Probability of Real
+            all_scores.extend(probs[:, 1].cpu().numpy())
             
     all_labels = np.array(all_labels)
     all_scores = np.array(all_scores)

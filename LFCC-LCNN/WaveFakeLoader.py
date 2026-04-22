@@ -140,12 +140,9 @@ class WaveFakeDatasetFixed(Dataset):
                 raise RuntimeError(f"FATAL: Dataset inaccessible. last: {audio_path}")
             waveform = torch.zeros(1, self.max_length)
         
-        # SCIENTIFIC RIGOR: Apply noise BEFORE peak normalization
         if self.noise_std > 0:
             noise = torch.randn_like(waveform) * self.noise_std
             waveform = waveform + noise
-
-        # Peak normalization after noise to maintain strict 1.0 constraint
         peak = torch.max(torch.abs(waveform))
         if peak > 0:
             waveform = waveform / peak

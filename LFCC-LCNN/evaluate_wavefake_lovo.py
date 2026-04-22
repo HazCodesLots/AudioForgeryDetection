@@ -7,7 +7,6 @@ from feature_extraction import LFCCExtractor
 from WaveFakeLoader import WaveFakeDatasetFixed
 from train import LFCCLCNNTrainer
 
-# Official 6-Fold LOO Configuration
 OFFICIAL_FOLDS = [
     "Fold1_MelGAN", "Fold2_MelGAN_Large", "Fold3_FB_MelGAN",
     "Fold4_MB_MelGAN", "Fold5_HiFiGAN", "Fold6_ParallelWaveGAN"
@@ -18,7 +17,6 @@ def evaluate_official_benchmarks(splits_json, device='cuda'):
     script_dir = os.path.dirname(os.path.abspath(__file__))
     results = {}
 
-    # 1. Evaluate ID Baseline
     id_weight = os.path.join(script_dir, 'weights', 'protocol', 'id_baseline', 'id_baseline_best.pt')
     if os.path.exists(id_weight):
         print("\n--- Evaluating ID Baseline (In-Distribution) ---")
@@ -38,7 +36,6 @@ def evaluate_official_benchmarks(splits_json, device='cuda'):
         results['ID_Baseline'] = {'eer': eer, 'acc': acc}
         print(f"  ID Baseline Result -> EER: {eer:.4f}%, Acc: {acc*100:.2f}%")
 
-    # 2. Evaluate 6 LOO Folds
     loo_results = {}
     print("\n--- Evaluating 6-Fold LOO (Architecture-Agnostic) ---")
     for fold in OFFICIAL_FOLDS:
@@ -51,8 +48,6 @@ def evaluate_official_benchmarks(splits_json, device='cuda'):
         model = LCNN(n_lfcc=60, num_classes=2).to(device)
         model.load_state_dict(checkpoint['model_state_dict'])
         
-        # Determine test vocoders from the fold name
-        # Mapping back from fold name to vocoder key
         mapping = {
             "Fold1_MelGAN": ["ljspeech_melgan"],
             "Fold2_MelGAN_Large": ["ljspeech_melgan_large"],

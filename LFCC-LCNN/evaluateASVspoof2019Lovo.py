@@ -58,7 +58,6 @@ def evaluate_on_asvspoof(protocol, data, device='cuda'):
     dataset = ASVspoof2019Dataset(protocol, data)
     loader = DataLoader(dataset, batch_size=64, shuffle=False, num_workers=4)
     eers = []
-    # 1. Evaluate ID Baseline (The control group)
     id_weight = os.path.join(script_dir, 'weights', 'protocol', 'id_baseline', 'id_baseline_best.pt')
     if os.path.exists(id_weight):
         print("  Testing ID Baseline (Control)...")
@@ -72,14 +71,12 @@ def evaluate_on_asvspoof(protocol, data, device='cuda'):
         y_true, y_score = [], []
         with torch.no_grad():
             for w, l in tqdm(loader, desc="ID_Baseline", leave=False):
-                # Run extraction on CPU since extractor is on CPU
                 lfcc = ext(w.squeeze(1)).unsqueeze(1).to(device)
                 s = F.softmax(model(lfcc), dim=1)[:, 1].cpu().numpy()
                 y_true.extend(l); y_score.extend(s)
         eer = calculate_eer(y_true, y_score)
         print(f"    ID Baseline EER: {eer:.4f}%")
 
-    # 2. Evaluate LOO Folds
     for fold in OFFICIAL_FOLDS:
         weight = os.path.join(script_dir, 'weights', 'protocol', fold, f'{fold}_best.pt')
         if not os.path.exists(weight): continue
@@ -94,7 +91,6 @@ def evaluate_on_asvspoof(protocol, data, device='cuda'):
         y_true, y_score = [], []
         with torch.no_grad():
             for w, l in tqdm(loader, desc=fold, leave=False):
-                # Run extraction on CPU since extractor is on CPU
                 lfcc = ext(w.squeeze(1)).unsqueeze(1).to(device)
                 s = F.softmax(model(lfcc), dim=1)[:, 1].cpu().numpy()
                 y_true.extend(l); y_score.extend(s)

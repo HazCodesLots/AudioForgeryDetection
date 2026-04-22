@@ -9,7 +9,6 @@ import numpy as np
 import os
 from feature_extraction import LFCCExtractor
 
-# Official 6-Fold LOO Configuration (Strict LJSpeech Only)
 OFFICIAL_6_FOLDS = {
     "Fold1_MelGAN": {
         "test": ['ljspeech_melgan'],
@@ -38,9 +37,7 @@ OFFICIAL_6_FOLDS = {
 }
 
 def scenario_b_official_loo(splits_json, device='cuda', start_idx=1, end_idx=None):
-    """
-    Official Scenario B: 6-Fold Leave-One-Out (LOO) with 3-way Split
-    """
+    
     print("SCENARIO B: OFFICIAL 6-FOLD LEAVE-ONE-OUT (LOO)")
     
     fold_keys = sorted(list(OFFICIAL_6_FOLDS.keys()))
@@ -54,7 +51,6 @@ def scenario_b_official_loo(splits_json, device='cuda', start_idx=1, end_idx=Non
     script_dir = os.path.dirname(os.path.abspath(__file__))
     results_file = os.path.join(script_dir, 'weights', 'protocol', 'loo_6fold_official_results.json')
     
-    # JSON Persistence: Load existing results
     results = {}
     if os.path.exists(results_file):
         try:
@@ -83,18 +79,14 @@ def scenario_b_official_loo(splits_json, device='cuda', start_idx=1, end_idx=Non
         os.makedirs(save_dir, exist_ok=True)
         save_path = os.path.join(save_dir, f'{fold_name}_best.pt')
 
-        # 3-WAY SPLIT IMPLEMENTATION
-        # 1. True Train: 'train' split of the training vocoders
         train_dataset = WaveFakeDatasetFixed(
             splits_json=splits_json, split_type='train', vocoders_to_include=train_vocoders,
             include_real=True, lfcc_extractor=lfcc_extractor
         )
-        # 2. Validation: 'test' split of the SAME training vocoders (In-Distribution Validation)
         val_dataset = WaveFakeDatasetFixed(
             splits_json=splits_json, split_type='test', vocoders_to_include=train_vocoders,
             include_real=True, lfcc_extractor=lfcc_extractor, balance_classes=True
         )
-        # 3. Final Test: 'test' split of the HELD-OUT vocoder (Unseen Architecture Test)
         test_dataset = WaveFakeDatasetFixed(
             splits_json=splits_json, split_type='test', vocoders_to_include=held_out_vocoders,
             include_real=True, lfcc_extractor=lfcc_extractor, balance_classes=True
@@ -118,10 +110,8 @@ def scenario_b_official_loo(splits_json, device='cuda', start_idx=1, end_idx=Non
             val_loader=val_loader, device=device, lr=0.0001, class_weights=class_weights
         )
         
-        # Train using the In-Distribution Validation set
         trainer.train(num_epochs=30, save_path=save_path)
         
-        # FINAL BENCHMARK on Unseen Architecture
         print(f"\n[FINAL BENCHMARK] Evaluating on held-out {held_out_vocoders}...")
         _, acc, auc, eer, _, _ = trainer.validate(desc='Unseen Eval', loader=test_loader)
         

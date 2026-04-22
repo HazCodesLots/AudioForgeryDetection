@@ -21,7 +21,7 @@ class LFCCLCNNTrainer:
         class_weights=None
     ):
         self.model = model.to(device)
-        self.lfcc_extractor = lfcc_extractor # Fixed: Stay on CPU for DataLoader workers
+        self.lfcc_extractor = lfcc_extractor
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.device = device

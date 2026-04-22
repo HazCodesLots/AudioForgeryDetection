@@ -23,28 +23,24 @@ def train_id_baseline(splits_json, device='cuda'):
         sample_rate=16000, n_fft=512, win_length=400, hop_length=160, n_lfcc=60, n_filter=60
     )
 
-    # 1. True Train
     train_dataset = WaveFakeDatasetFixed(
         splits_json=splits_json, split_type='train', vocoders_to_include=None,
         include_real=True, lfcc_extractor=lfcc_extractor
     )
 
-    # 2. Split TEST into Val and Final-Test
     full_test_dataset = WaveFakeDatasetFixed(
         splits_json=splits_json, split_type='test', vocoders_to_include=None,
         include_real=True, lfcc_extractor=lfcc_extractor, balance_classes=True
     )
 
-    # We manually split the dataset to avoid leakage
     random.seed(42)
     indices = list(range(len(full_test_dataset.samples)))
     random.shuffle(indices)
-    split_idx = int(len(indices) * 0.5) # 50/50 split of the test set
+    split_idx = int(len(indices) * 0.5)
     
     val_indices = indices[:split_idx]
     test_indices = indices[split_idx:]
     
-    # Simple subsetting logic
     original_samples = full_test_dataset.samples
     full_test_dataset.samples = [original_samples[i] for i in val_indices]
     val_dataset = full_test_dataset
