@@ -9,15 +9,6 @@ A comprehensive training and evaluation framework for audio classification, spea
 ### 📊 ResNet-18 Overall EER: 3.15% MFCC 80/20 split  ODSS Validation set
 ### **Detailed architectures, explanations, and training metrics are provided in the respective sub-folder READMEs.**
 
-Each component is isolated into a dedicated submodule for readability:  
-```text
-├── Classifier/          # Decision heads
-├── Data_Augmentation/   # Audio transformations
-├── Feature_Extraction/  # Acoustic representations
-├── Frontend/            # Encoder networks
-├── Pooling/             # Frame-level aggregation
-```
-
 ![Python](https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white)
 ![PyTorch](https://img.shields.io/badge/PyTorch-EE4C2C?style=for-the-badge&logo=pytorch&logoColor=white)
 ![CUDA](https://img.shields.io/badge/CUDA-76B900?style=for-the-badge&logo=nvidia&logoColor=white)
