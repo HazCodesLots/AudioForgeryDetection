@@ -3,23 +3,22 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import math
-from torch.optim import Adam, AdamW
+from torch.optim import Adam
 from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau, LinearLR, SequentialLR
 import torch.utils.checkpoint as checkpoint
 from sklearn.metrics import roc_curve
 from scipy.optimize import brentq
 from scipy.interpolate import interp1d
+from scipy.signal import butter, filtfilt
 from tqdm import tqdm
 import os
 import json
 from datetime import datetime
 from typing import Tuple, Optional
-import random
 import gc
 import pandas as pd
 from pathlib import Path
 import librosa
-
 
 
 class KANLayer(nn.Module):
@@ -28,7 +27,7 @@ class KANLayer(nn.Module):
     Uses 'Efficient-KAN' principles with precomputed grid denominators and 
     stable initialization to prevent gradient explosions.
     """
-    def __init__(self, in_features, out_features, grid_size=5, spline_order=3, grid_range=(-1, 1), base_activation=nn.SiLU):
+    def __init__(self, in_features, out_features, grid_size=16, spline_order=4, grid_range=(-1, 1), base_activation=nn.PReLU):
         super(KANLayer, self).__init__()
         self.in_features = in_features
         self.out_features = out_features
@@ -51,9 +50,9 @@ class KANLayer(nn.Module):
         self.register_buffer("grid", extended_grid)
         
         self.spline_coeffs = nn.Parameter(
-            torch.randn(out_features, in_features, grid_size + spline_order) * 0.001
+            torch.randn(out_features, in_features, grid_size + spline_order) * 1e-4
         )
-        self.dropout = nn.Dropout(0.1)
+        self.dropout = nn.Dropout(0.2)
 
     def b_splines(self, x: torch.Tensor):
         """
@@ -93,20 +92,30 @@ class KANLayer(nn.Module):
         Forward pass for KAN layer.
         x: (batch, in_features)
         Returns: (batch, out_features)
+
+        Design note: tanh is applied ONLY to the spline path to keep inputs
+        within the B-spline grid range [-1, 1].  The base (linear) path uses
+        the raw (dropped-out) input so that PReLU + linear has an unobstructed
+        gradient highway — avoiding the saturation-induced vanishing gradients
+        that occur when tanh is applied to both paths in deep KAN stacks.
         """
         if x.dim() != 2:
             raise ValueError(f"Expected 2D input, got {x.dim()}D: {x.shape}")
-        
-        x = torch.tanh(x)
+
         x = self.dropout(x)
+
+        # Base path: PReLU + linear — no tanh saturation, clean gradient flow
         base_output = F.linear(self.base_activation(x), self.base_weight)
-        
-        bases = self.b_splines(x)
-        
+
+        # Spline path: tanh maps input into grid range [-1, 1] for valid B-splines
+        x_scaled = torch.tanh(x)
+        bases = self.b_splines(x_scaled)
+
         scaled_coeffs = self.spline_coeffs.clamp(-5.0, 5.0) * self.spline_weight.unsqueeze(-1)
-        
-        spline_output = torch.einsum("bij,oij->bo", bases, scaled_coeffs)
-        
+
+        residual_scale = 0.1
+        spline_output = torch.einsum("bij,oij->bo", bases, scaled_coeffs) * residual_scale
+
         return base_output + spline_output
 
 
@@ -159,50 +168,40 @@ class SincConv(nn.Module):
         self.sample_rate = sample_rate
         self.kernel_size = kernel_size
         self.out_channels = out_channels
-        self.min_low_hz = min_low_hz
-        self.min_band_hz = min_band_hz
 
-        num_filters = out_channels
-        low_hz = 30
-        high_hz = self.sample_rate / 2 - (min_low_hz + min_band_hz)
-
-        mel = np.linspace(self.to_mel(low_hz), self.to_mel(high_hz), num_filters + 1)
+        low_hz_start = 30
+        high_hz_start = sample_rate / 2 - (min_low_hz + min_band_hz)
+        mel = np.linspace(self.to_mel(low_hz_start), self.to_mel(high_hz_start), out_channels + 1)
         hz = self.to_hz(mel)
 
-        self.low_hz_ = nn.Parameter(torch.from_numpy(hz[:-1]).float().view(-1, 1))
-        self.band_hz_ = nn.Parameter(torch.from_numpy(np.diff(hz)).float().view(-1, 1))
+        low = torch.from_numpy(hz[:-1]).float().view(-1, 1) + min_low_hz
+        high = (low +min_band_hz + torch.from_numpy(np.diff(hz)).float().view(-1,1))
+        high = high.clamp(min_low_hz, sample_rate / 2 - 1.0)
 
-        self.register_buffer('window_', torch.hamming_window(self.kernel_size, periodic=False).view(1, -1))
+        n = (kernel_size -1) / 2.0
+        t = (torch.arange(-n, n+1) / sample_rate).view(1, -1)
+        window = torch.hamming_window(kernel_size, periodic=False).view(1, -1)
+        mid = kernel_size // 2
+        n_safe =  t.abs().clamp(min=1.0/sample_rate)
+        f_low =  torch.matmul(low, t)
+        f_high = torch.matmul(high, t)
+        
+        sinc_low = torch.sin(2 * math.pi * f_low) / (math.pi * n_safe)
+        sinc_high = torch.sin(2 * math.pi * f_high) / (math.pi * n_safe)
 
-        n = (self.kernel_size - 1) / 2.0
-        self.register_buffer('n_', (torch.arange(-n, n + 1).view(1, -1) / self.sample_rate))
+        sinc_low[:, mid] = 2.0 * low.squeeze(-1) / sample_rate
+        sinc_high[:, mid] = 2.0 * high.squeeze(-1) / sample_rate
+
+        filters = (sinc_high - sinc_low) * window
+        filters = filters / filters.norm(p=2, dim=1, keepdim=True).clamp(min=1e-8)
+
+        # Non-trainable: the paper explicitly uses fixed mel-spaced sinc filters
+        # (Section 2.3: "we use the non-trainable SincConv").
+        self.register_buffer('filters_', filters.view(out_channels, 1, kernel_size))
+
 
     def forward(self, waveforms):
-        low = self.min_low_hz + torch.abs(self.low_hz_)
-        high = torch.clamp(
-            low + self.min_band_hz + torch.abs(self.band_hz_),
-            self.min_low_hz,
-            self.sample_rate / 2 - 1.0
-        )
-
-        f_times_t_low = torch.matmul(low, self.n_)
-        f_times_t_high = torch.matmul(high, self.n_)
-
-        mid = self.kernel_size // 2
-        n_safe = self.n_.abs().clamp(min=1.0 / self.sample_rate)
-
-        filters_low = torch.sin(2 * math.pi * f_times_t_low) / (math.pi * n_safe)
-        filters_high = torch.sin(2 * math.pi * f_times_t_high) / (math.pi * n_safe)
-
-        filters_low[:, mid] = 2.0 * low.squeeze(-1) / self.sample_rate
-        filters_high[:, mid] = 2.0 * high.squeeze(-1) / self.sample_rate
-
-        filters = (filters_high - filters_low) * self.window_
-
-        norms = filters.norm(p=2, dim=1, keepdim=True).clamp(min=1e-8)
-        filters = filters / norms
-
-        return F.conv1d(waveforms, filters.view(self.out_channels, 1, self.kernel_size))
+        return F.conv1d(waveforms, self.filters_)
 
 
 class RawFrontend(nn.Module):
@@ -242,43 +241,127 @@ class AudioProcessor:
             # Load audio using librosa
             waveform, sr = librosa.load(audio_path, sr=self.sample_rate, mono=True)
             
-            # Convert numpy array to torch tensor
+            # Convert numpy array to torch tensor (1D: [samples])
             waveform = torch.from_numpy(waveform).float()
             
             return waveform, self.sample_rate
         except Exception as e:
             raise RuntimeError(f"Failed to load audio from {audio_path}: {str(e)}")
 
-    def pad_or_crop(self, audio: torch.Tensor, length: Optional[int] = None) -> torch.Tensor:
+    def pad_or_crop(self, audio: torch.Tensor, length: Optional[int] = None,
+                    random_crop: bool = False) -> torch.Tensor:
         if length is None:
             length = self.max_length_samples
 
         current_length = audio.shape[0]
 
         if current_length > length:
-            start_idx = (current_length - length) // 2
+            if random_crop:
+                # Paper Section 3.3: "A random portion of the audio sample was
+                # extracted or padded during training." Random offset each epoch
+                # prevents the model from memorising codec fingerprints that are
+                # concentrated in the center of the waveform.
+                max_start = current_length - length
+                start_idx = int(torch.randint(0, max_start + 1, (1,)).item())
+            else:
+                # Deterministic center crop for validation / inference.
+                start_idx = (current_length - length) // 2
             audio = audio[start_idx:start_idx + length]
         elif current_length < length:
             pad_amount = length - current_length
             audio = torch.nn.functional.pad(audio, (0, pad_amount))
         return audio
 
-    def process(self, audio: torch.Tensor) -> torch.Tensor:
-        """Pad, crop, and normalize raw audio for AASIST3_Raw.
+    def process(self, audio: torch.Tensor, random_crop: bool = False) -> torch.Tensor:
+        """Pad/crop and normalise raw audio for AASIST3_Raw.
 
-        NOTE: Do NOT apply pre-emphasis here. The RawFrontend inside the model
-        already handles this as its first step. Applying it twice over-filters
-        the signal and causes gradient explosions in SincConv.
+        During training pass random_crop=True so each epoch sees a different
+        slice of the waveform (paper Section 3.3).  Validation always uses the
+        deterministic centre crop for reproducibility.
+
+        NOTE: Pre-emphasis is NOT applied here — it is applied inside the model
+        by RawFrontend → PreEmphasis.
         """
         # 1. Pad/crop to fixed length
-        audio = self.pad_or_crop(audio)
+        audio = self.pad_or_crop(audio, random_crop=random_crop)
 
-        # 2. Instance normalization (zero mean, unit variance)
-        mean = audio.mean()
-        std = torch.clamp(audio.std(), min=1e-5)
-        audio = (audio - mean) / std
+        # 2. Peak normalisation (safe)
+        max_val = audio.abs().max()
+        if max_val > 1.0:
+            audio = audio / max_val
 
         return audio.unsqueeze(0)  # (1, samples)
+
+    def augment_waveform(
+        self,
+        audio: torch.Tensor,
+        p_apply: float = 0.4,
+    ) -> torch.Tensor:
+        """
+        Lightweight on-the-fly training augmentation using only numpy/scipy/
+        librosa — no external noise/RIR corpus or ffmpeg required.
+
+        At most ONE transform is applied per sample (mutually exclusive, not
+        stacked): an earlier version applied each independently, which meant
+        ~88% of samples got 1-2+ compounded transforms and destroyed far more
+        signal than any single one — that version produced a >50x regression
+        in val_min_dcf within a single epoch versus no augmentation at all.
+
+        'lowpass'/'quantize' specifically target the codec/bandwidth
+        robustness gap ASVspoof5's eval track stresses (approximating
+        lossy-codec artifacts). 'gain'/'noise'/'pitch' are generic
+        perturbations.
+
+        NOTE: the AASIST3 paper (Section 3.3) found *generic* noise/RIR/pitch
+        augmentation hurt their closed-condition (SincConv) model relative to
+        no augmentation — only pre-emphasis helped there. Their open-condition
+        (wav2vec2) model did use similar augmentation successfully, but paired
+        with extra training data. Treat this as an experimental knob and
+        compare val_min_dcf with/without it, not an assumed win.
+        """
+        if np.random.rand() >= p_apply:
+            return audio
+
+        x = audio.squeeze(0).numpy().astype(np.float32)  # (samples,)
+        kind = np.random.choice(
+            ['gain', 'lowpass', 'quantize', 'noise', 'pitch'],
+            p=[0.2, 0.2, 0.2, 0.3, 0.1],
+        )
+
+        if kind == 'gain':
+            x = x * np.random.uniform(0.7, 1.3)
+
+        elif kind == 'lowpass':
+            cutoff = np.random.uniform(3000, 7500)
+            nyq = self.sample_rate / 2
+            b, a = butter(4, cutoff / nyq, btype='low')
+            x = filtfilt(b, a, x).astype(np.float32)
+
+        elif kind == 'quantize':
+            # mu-law compand + 8-bit quantize + expand: approximates the
+            # quantization noise introduced by lossy speech codecs.
+            mu = 255.0
+            x_c = np.clip(x, -1.0, 1.0)
+            x_mu = np.sign(x_c) * np.log1p(mu * np.abs(x_c)) / np.log1p(mu)
+            x_q = np.round((x_mu + 1) / 2 * mu) / mu * 2 - 1
+            x = (np.sign(x_q) * np.expm1(np.abs(x_q) * np.log1p(mu)) / mu).astype(np.float32)
+
+        elif kind == 'noise':
+            snr_db = np.random.uniform(5, 25)
+            sig_power = np.mean(x ** 2) + 1e-10
+            noise_power = sig_power / (10 ** (snr_db / 10))
+            noise = np.random.normal(0, np.sqrt(noise_power), size=x.shape).astype(np.float32)
+            x = x + noise
+
+        elif kind == 'pitch':
+            n_steps = np.random.uniform(-2.0, 2.0)
+            x = librosa.effects.pitch_shift(x, sr=self.sample_rate, n_steps=n_steps).astype(np.float32)
+
+        out = torch.from_numpy(np.ascontiguousarray(x)).unsqueeze(0)
+        max_val = out.abs().max()
+        if max_val > 1.0:
+            out = out / max_val
+        return out
 
     def create_sliding_windows(self, audio: torch.Tensor, window_seconds: float = 4.0, overlap_seconds: float = 2.0) -> torch.Tensor:
         window_samples = int(self.sample_rate * window_seconds)
@@ -310,112 +393,95 @@ class AudioProcessor:
         return torch.stack(windows)
 
 
+
 class RawASV5Dataset(torch.utils.data.Dataset):
     """
-    Dataset class for ASVspoof5 Raw Waveforms.
-    Loads .flac files on the fly and returns raw waveform tensors.
+    Dataset class for ASVspoof5 raw waveforms.
+    TSV format (train + dev track 1):
+        col 0: SPEAKER_ID
+        col 1: FLAC_FILE_NAME
+        col 8: KEY  ->  'spoof' or 'bonafide'
+
+    Returns:
+        waveform: Tensor (1, max_len)
+        label:    LongTensor scalar, 0=bonafide, 1=spoof
     """
-    def __init__(self, audio_dir, protocol_file, max_len=64600, is_train=False):
+    def __init__(self, audio_dir, protocol_file,
+                 max_len=64600, is_train=False, strict_labels=True, augment=False):
         self.audio_dir = Path(audio_dir)
         self.max_len = max_len
         self.is_train = is_train
-        self.processor = AudioProcessor(sample_rate=16000, max_length_seconds=max_len/16000)
-        
+        # Augmentation is only ever applied when is_train=True (see
+        # __getitem__) — dev/eval always see clean, deterministic audio.
+        self.augment = augment
+        self.processor = AudioProcessor(
+            sample_rate=16000,
+            max_length_seconds=max_len / 16000
+        )
+
         print(f"Loading protocol: {protocol_file}")
-        df = pd.read_csv(protocol_file, sep=' ', header=None)
-        print(f"Protocol shape: {df.shape}")
-        print(f"First row: {df.iloc[0].tolist() if len(df) > 0 else 'Empty'}")
-        
-        self.file_ids = df[1].values
-        
-        # Detect label column (usually column 6 or 8)
-        label_col = None
-        for col in [8, 6, 7]:
-            if col in df.columns:
-                try:
-                    test_val = df[col].iloc[0]
-                    if test_val in ['spoof', 'bonafide', '-']:
-                        label_col = col
-                        print(f"Detected label column: {col} (value: {test_val})")
-                        break
-                except:
-                    continue
-        
-        if label_col is None:
-            raise ValueError(f"Could not find label column in protocol. Columns: {df.columns.tolist()}")
-        
-        # Map labels: spoof=1, bonafide=0, -=0 (unknown treated as bonafide)
-        self.labels = df[label_col].apply(
-            lambda x: 1 if x == 'spoof' else 0
-        ).values
+        df = pd.read_csv(protocol_file, sep=r"\s+", header=None, engine="python")
+
+        raw_labels = df[8].astype(str)
+        valid = set(raw_labels.unique())
+
+        if strict_labels and not valid.issubset({"spoof", "bonafide"}):
+            raise ValueError(
+                f"Unexpected values in label column 8: {valid}\n"
+                f"Use strict_labels=False for eval sets with withheld labels."
+            )
+
+        self.speaker_ids = df[0].astype(str).values
+        self.file_ids    = df[1].astype(str).values
+        self.labels      = (raw_labels == "spoof").astype(np.int64).values
+
+        print(f"Dataset summary:")
+        print(f"  Raw unique labels: {sorted(raw_labels.unique())}")
+        print(f"  Raw label counts:\n{raw_labels.value_counts().sort_index()}")
+        print(f"  Numeric labels: 0={int((self.labels == 0).sum())}, 1={int((self.labels == 1).sum())}")
+        print(f"  Sample rows:")
+        for i in range(min(3, len(df))):
+            print(f"    {df.iloc[i][0]:10s} {df.iloc[i][1]:20s} ... {df.iloc[i][8]:10s}")
+        print()  # blank line
+
+        n_bonafide = int((self.labels == 0).sum())
+        n_spoof    = int((self.labels == 1).sum())
+        print(f"Loaded {len(self.file_ids)} samples — "
+              f"bonafide: {n_bonafide}, spoof: {n_spoof}")
 
     def get_class_weights(self):
-        """Automatically calculate class weights for balancing."""
-        count_0 = np.sum(self.labels == 0) # Bonafide
-        count_1 = np.sum(self.labels == 1) # Spoof
-        total = count_0 + count_1
-        
+        """Balanced class weights: w_c = total / (n_classes * count_c)"""
+        count_0 = int(np.sum(self.labels == 0))  # bonafide
+        count_1 = int(np.sum(self.labels == 1))  # spoof
+        total   = count_0 + count_1
         w_bonafide = total / (2 * count_0) if count_0 > 0 else 1.0
-        w_spoof = total / (2 * count_1) if count_1 > 0 else 1.0
+        w_spoof    = total / (2 * count_1) if count_1 > 0 else 1.0
+        print(f"Class weights -> bonafide: {w_bonafide:.4f}, spoof: {w_spoof:.4f}")
         return [w_bonafide, w_spoof]
 
     def __len__(self):
         return len(self.file_ids)
 
     def __getitem__(self, idx):
-        file_id = self.file_ids[idx]
-        label = self.labels[idx]
+        file_id   = self.file_ids[idx]
+        label     = self.labels[idx]
         file_path = self.audio_dir / f"{file_id}.flac"
-        
+
         try:
             waveform, _ = self.processor.load_audio(str(file_path))
-            if self.is_train:
-                # Random time stretching
-                if random.random() < 0.3:
-                    rate = random.uniform(0.95, 1.05)
-                    waveform_np = waveform.numpy()
-                    waveform_np = librosa.effects.time_stretch(waveform_np, rate=rate)
-                    # Ensure same length
-                    if waveform_np.shape[-1] > self.max_len:
-                        waveform_np = waveform_np[..., :self.max_len]
-                    elif waveform_np.shape[-1] < self.max_len:
-                        waveform_np = np.pad(waveform_np, (0, self.max_len - waveform_np.shape[-1]))
-                    waveform = torch.from_numpy(waveform_np).float()
+            # Training: random crop so the model sees a different slice every
+            # epoch — prevents memorising codec fingerprints at a fixed offset.
+            # Validation: deterministic centre crop for reproducibility.
+            waveform = self.processor.process(waveform, random_crop=self.is_train)
 
-                # Random gain with larger range
-                if random.random() < 0.5:
-                    gain = random.uniform(0.7, 1.3)
-                    waveform = waveform * gain
-                    waveform = torch.clamp(waveform, -1.0, 1.0)  # Prevent clipping artifacts
-                
-                # Larger additive noise
-                if random.random() < 0.4:
-                    noise = torch.randn_like(waveform) * random.uniform(0.001, 0.005)
-                    waveform = waveform + noise
-                
-                # Spec-style noise bursts (random silence regions)
-                if random.random() < 0.2:
-                    num_bursts = random.randint(1, 3)
-                    for _ in range(num_bursts):
-                        v_len = waveform.shape[-1]
-                        if v_len > 4000:
-                            burst_start = random.randint(0, v_len - 4000)
-                            burst_len = random.randint(1000, 4000)
-                            if burst_start + burst_len <= v_len:
-                                waveform[burst_start:burst_start + burst_len] *= random.uniform(0.0, 0.3)
-
-            waveform = self.processor.process(waveform)  # (1, samples)
-
-            if waveform.shape[-1] > self.max_len:
-                waveform = waveform[..., :self.max_len]
-            elif waveform.shape[-1] < self.max_len:
-                waveform = F.pad(waveform, (0, self.max_len - waveform.shape[-1]))
-            return waveform, torch.tensor(label).long()
+            if self.is_train and self.augment:
+                waveform = self.processor.augment_waveform(waveform)
 
         except Exception as e:
             print(f"Warning: Failed to load {file_path}: {e}")
-            return torch.zeros((1, self.max_len)), torch.tensor(label).long()
+            waveform = torch.zeros((1, self.max_len), dtype=torch.float32)
 
+        return waveform, torch.tensor(label, dtype=torch.long), str(file_path)
 
 
 class PositionalEmbedding(nn.Module):
@@ -656,12 +722,16 @@ class AASIST3_Raw(nn.Module):
         self.backbone = MultiBranchArchitecture(
             temporal_dim=temporal_dim,
             spatial_dim=spatial_dim,
-            num_temporal_nodes=num_temporal_nodes,
-            num_spatial_nodes=num_spatial_nodes,
+            # Pass the pooled node counts that GraphFormation actually outputs,
+            # so all branches are sized correctly for parallel operation.
+            num_temporal_nodes=self.graph_formation.pooled_temporal_nodes,
+            num_spatial_nodes=self.graph_formation.pooled_spatial_nodes,
             stack_dim=stack_dim,
             num_branches=num_branches,
             pool_ratio=pool_ratio,
-            temperature=temperature
+            temperature=temperature,
+            dropout_p1=0.2,
+            dropout_p2=0.5
         )
         
         self.output_head = AASIST3OutputHead(
@@ -1074,7 +1144,7 @@ class BranchModule(nn.Module):
 
 
 class MultiBranchArchitecture(nn.Module):
-    def __init__(self, temporal_dim, spatial_dim, num_temporal_nodes, num_spatial_nodes, stack_dim, num_branches=4, pool_ratio=0.5, temperature=1.0, dropout_p1=0.4, dropout_p2=0.5):
+    def __init__(self, temporal_dim, spatial_dim, num_temporal_nodes, num_spatial_nodes, stack_dim, num_branches=4, pool_ratio=0.5, temperature=1.0, dropout_p1=0.2, dropout_p2=0.5):
         super(MultiBranchArchitecture, self).__init__()
 
         self.num_branches = num_branches
@@ -1085,29 +1155,26 @@ class MultiBranchArchitecture(nn.Module):
         self.stack_node_init = nn.Parameter(torch.randn(1, stack_dim))
         nn.init.normal_(self.stack_node_init, mean=0.0, std=0.02)
 
-        self.branches = nn.ModuleList()
-        current_temporal_nodes = num_temporal_nodes
-        current_spatial_nodes = num_spatial_nodes
-
-        for i in range(num_branches):
-            use_cp = True 
-            branch = BranchModule(
-                temporal_dim=temporal_dim, 
-                spatial_dim=spatial_dim, 
-                num_temporal_nodes=current_temporal_nodes, 
-                num_spatial_nodes=current_spatial_nodes, 
-                stack_dim=stack_dim, 
-                pool_ratio=pool_ratio, 
-                temperature=temperature,
-                use_checkpoint=use_cp
-            )
-            self.branches.append(branch)
-
-            current_temporal_nodes = branch.pooled_temporal_nodes
-            current_spatial_nodes = branch.pooled_spatial_nodes
-
-        self.dropout1 = nn.Dropout(dropout_p1)
+        self.dropout_branch = nn.Dropout(dropout_p1)
+        self.dropout_out = nn.Dropout(dropout_p2)
         self.hidden_dim = 2 * temporal_dim + 2 * spatial_dim + stack_dim
+
+        # All branches are identical and run in PARALLEL on the same input
+        # (paper Section 2.10: "passed in parallel through four branches").
+        # They are NOT chained sequentially — that would shrink the graph to
+        # a single node by the 4th branch and make attention meaningless.
+        self.branches = nn.ModuleList()
+        for _ in range(num_branches):
+            self.branches.append(BranchModule(
+                temporal_dim=temporal_dim,
+                spatial_dim=spatial_dim,
+                num_temporal_nodes=num_temporal_nodes,
+                num_spatial_nodes=num_spatial_nodes,
+                stack_dim=stack_dim,
+                pool_ratio=pool_ratio,
+                temperature=temperature,
+                use_checkpoint=True
+            ))
 
     def forward(self, h_t_init, h_s_init):
         batch_size = h_t_init.size(0)
@@ -1117,57 +1184,29 @@ class MultiBranchArchitecture(nn.Module):
         spatial_outputs = []
         stack_outputs = []
 
-        h_t_current = h_t_init
-        h_s_current = h_s_init
-        S_current = S_init
-
-        for i, branch in enumerate(self.branches):
-            h_t_out, h_s_out, S_out = branch(h_t_current, h_s_current, S_current)
-
+        for branch in self.branches:
+            h_t_out, h_s_out, S_out = branch(h_t_init, h_s_init, S_init)
             temporal_outputs.append(h_t_out)
             spatial_outputs.append(h_s_out)
             stack_outputs.append(S_out)
 
-            h_t_current = h_t_out
-            h_s_current = h_s_out
-            S_current = S_out
-        
-        max_temporal_nodes = max(t.size(1) for t in temporal_outputs)
-        max_spatial_nodes = max(s.size(1) for s in spatial_outputs)
+        H_t = torch.stack(temporal_outputs, dim=1)  # (B, num_branches, pooled_t, temporal_dim)
+        H_s = torch.stack(spatial_outputs, dim=1)   # (B, num_branches, pooled_s, spatial_dim)
+        S_f = torch.stack(stack_outputs, dim=1)     # (B, num_branches, stack_dim)
 
-        temporal_padded = []
-        for h_t in temporal_outputs:
-            if h_t.size(1) < max_temporal_nodes:
-                pad_size = max_temporal_nodes - h_t.size(1)
-                h_t_padded = F.pad(h_t, (0, 0, 0, pad_size))
-            else:
-                h_t_padded = h_t
-            temporal_padded.append(h_t_padded)
+        H_t = self.dropout_branch(H_t)
+        H_s = self.dropout_branch(H_s)
+        S_f = self.dropout_branch(S_f)
 
-        H_t = torch.stack(temporal_padded, dim=1)
-
-        spatial_padded = []
-        for h_s in spatial_outputs:
-            if h_s.size(1) < max_spatial_nodes:
-                pad_size = max_spatial_nodes - h_s.size(1)
-                h_s_padded = F.pad(h_s, (0, 0, 0, pad_size))
-            else:
-                h_s_padded = h_s
-            spatial_padded.append(h_s_padded)
-
-        H_s = torch.stack(spatial_padded, dim=1)
-        S_f = torch.stack(stack_outputs, dim=1)
-
-        H_max_t = H_t.max(dim=1)[0].max(dim=1)[0]
+        H_max_t  = H_t.max(dim=1)[0].max(dim=1)[0]
         H_mean_t = H_t.mean(dim=1).mean(dim=1)
-
-        H_max_s = H_s.max(dim=1)[0].max(dim=1)[0]
+        H_max_s  = H_s.max(dim=1)[0].max(dim=1)[0]
         H_mean_s = H_s.mean(dim=1).mean(dim=1)
-
-        S_max_f = S_f.max(dim=1)[0]
+        S_max_f  = S_f.max(dim=1)[0]
 
         hidden_features = torch.cat([H_max_t, H_mean_t, H_max_s, H_mean_s, S_max_f], dim=1)
-        hidden_features = self.dropout1(hidden_features)  # p=0.4 once
+
+        hidden_features = self.dropout_out(hidden_features)
         return hidden_features
 
 
@@ -1268,29 +1307,6 @@ class FocalLoss(nn.Module):
             return focal_loss
 
 
-class CombinedLoss(nn.Module):
-    def __init__(
-        self,
-        focal_gamma=2.0,
-        ce_weight=0.5,
-        focal_weight=0.5,
-        label_smoothing=0.05
-    ):
-        super(CombinedLoss, self).__init__()
-        self.ce_weight = ce_weight
-        self.focal_weight = focal_weight
-        self.label_smoothing = label_smoothing
-        self.focal_loss = FocalLoss(alpha=None, gamma=focal_gamma)
-
-    def forward(self, inputs, targets):
-        ce_loss = F.cross_entropy(
-            inputs, targets,
-            label_smoothing=self.label_smoothing
-        )
-        focal_loss = self.focal_loss(inputs, targets)
-        return self.ce_weight * ce_loss + self.focal_weight * focal_loss
-
-
 class MetricsCalculation:
     @staticmethod
     def compute_eer(labels, scores):
@@ -1307,14 +1323,20 @@ class MetricsCalculation:
         return eer, threshold
     
     @staticmethod
-    def compute_min_dcf(labels, scores, p_target=0.05, c_miss=1, c_fa=1):
-        fpr, tpr, thresholds = roc_curve(labels, scores, pos_label=1)
+    def compute_min_dcf(labels, scores, c_miss=1, c_fa=10, pi_spf=0.05):
+        """Official ASVspoof5 Track 1 minDCF (no normalization).
+
+        DCF(τ) = β·P_miss(τ) + P_fa(τ)
+        β = C_miss·(1 − π_spf) / (C_fa·π_spf) = 1·0.95 / (10·0.05) = 1.9
+
+        With roc_curve(labels, scores, pos_label=1) [spoof=positive]:
+          fpr = P(spoof decision | bonafide) = P_miss (false rejection of bonafide)
+          fnr = P(bonafide decision | spoof) = P_fa   (false acceptance of spoof)
+        """
+        fpr, tpr, _ = roc_curve(labels, scores, pos_label=1)
         fnr = 1 - tpr
-        
-        dcf = c_miss * fnr * p_target + c_fa * fpr * (1 - p_target)
-        min_dcf = np.min(dcf)
-        
-        return min_dcf
+        beta = c_miss * (1 - pi_spf) / (c_fa * pi_spf)  # = 1.9
+        return float(np.min(beta * fpr + fnr))
     
     @staticmethod
     def compute_accuracy(labels, predictions):
@@ -1361,7 +1383,8 @@ class TrainAASIST3:
     
     def __init__(self, model, optimizer, criterion, device, scheduler=None,
                  checkpoint_dir='.', experiment_name='aasist3',
-                 accumulation_steps=4, use_amp=True, max_grad_norm=1.0):
+                 accumulation_steps=1, use_amp=True, max_grad_norm=1.0,
+                 max_len=64600, sample_rate=16000):
         self.model = model
         self.optimizer = optimizer
         self.criterion = criterion
@@ -1370,7 +1393,8 @@ class TrainAASIST3:
         self.accumulation_steps = accumulation_steps
         self.use_amp = use_amp
         self.max_grad_norm = max_grad_norm
-        self.freeze_frontend_epochs = 0 # Will be updated via property or externally
+        self.max_len = max_len
+        self.sample_rate = sample_rate
         self.scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
         self.last_val_metrics = None
         self.gap_threshold = 20.0
@@ -1418,10 +1442,9 @@ class TrainAASIST3:
         last_grad_norm = 0.0
         
         for batch_idx, batch in enumerate(pbar):
-            if len(batch) == 2:
-                audio, labels = batch
-                audio = audio.to(self.device)
-                labels = labels.to(self.device)
+            if len(batch) >= 2:
+                audio = batch[0].to(self.device)
+                labels = batch[1].to(self.device)
             else:
                 continue
             
@@ -1486,7 +1509,7 @@ class TrainAASIST3:
                 'grad': f'{last_grad_norm:.3f}',
                 'skip': self.skipped_steps
             }
-            if self.last_val_metrics:
+            if self.last_val_metrics and batch_idx >= 100:
                 last_val_acc = self.last_val_metrics.get('accuracy', 0)
                 gap = current_acc - last_val_acc
                 pbar_metrics['last_val'] = f"{last_val_acc:.1f}%"
@@ -1535,10 +1558,10 @@ class TrainAASIST3:
         
         with torch.no_grad():
             for batch in pbar:
-                if len(batch) == 2:
-                    audio, labels = batch
-                    audio = audio.to(self.device)
-                    labels = labels.to(self.device)
+                if len(batch) >= 2:
+
+                    audio = batch[0].to(self.device)
+                    labels = batch[1].to(self.device)
                 else:
                     continue
                 
@@ -1578,6 +1601,85 @@ class TrainAASIST3:
         
         return metrics
     
+    def validate_sliding_window(self, val_loader, window_sec=4.0, overlap_sec=2.0):
+        self.model.eval()
+        processor = AudioProcessor(sample_rate=16000, max_length_seconds=window_sec)
+        all_labels, all_scores, all_preds = [], [], []
+        total_loss, num_batches = 0.0, 0
+
+        pbar = tqdm(val_loader, desc=f'Epoch {self.current_epoch+1} [Val-SW]')
+        with torch.no_grad():
+            for batch in pbar:
+                # dataset now returns (waveform, label, path)
+                _, labels, paths = batch
+                labels = labels.to(self.device)
+
+                batch_scores = []
+                batch_preds = []
+                batch_logits_utt = []
+
+                for path in paths:
+                    raw, _ = processor.load_audio(path)
+                    windows = processor.create_sliding_windows(
+                        raw, window_seconds=window_sec, overlap_seconds=overlap_sec
+                    )  # (N_windows, max_len)
+
+                    # add channel dim → (N_windows, 1, max_len), normalize each window
+                    windows = torch.stack([
+                        processor.process(w) for w in windows
+                    ]).to(self.device)  # (N_windows, 1, max_len)
+
+                    with torch.amp.autocast('cuda', enabled=self.use_amp):
+                        logits = self.model(windows)          # (N_windows, 2)
+                        probs  = F.softmax(logits, dim=1)     # (N_windows, 2)
+                    
+                    utt_logits = logits.mean(dim=0, keepdim=True)
+                    utt_probs = F.softmax(utt_logits, dim=1)   
+                    utt_score = utt_probs[:,1].item()
+                    utt_pred = utt_logits.argmax(dim=1).item()
+
+                    batch_logits_utt.append(utt_logits)
+                    batch_scores.append(utt_score)
+                    batch_preds.append(utt_pred)
+                
+                batch_logits_utt = torch.cat(batch_logits_utt, dim=0)
+
+                with torch.amp.autocast('cuda', enabled=self.use_amp):
+                    loss = self.criterion(batch_logits_utt, labels)
+                
+                total_loss += loss.item()
+                num_batches += 1
+
+                batch_scores = torch.tensor(batch_scores, device=self.device)
+                batch_preds  = torch.tensor(batch_preds, device=self.device)
+
+                all_labels.append(labels.cpu().numpy())
+                all_scores.append(batch_scores.cpu().numpy())
+                all_preds.append(batch_preds.cpu().numpy())
+
+                running_acc = 100.0 * (np.concatenate(all_preds) == np.concatenate(all_labels)).mean()
+
+                pbar.set_postfix({
+                    'loss': f'{total_loss/num_batches:.4f}',
+                    'acc': f'{running_acc:.1f}%'
+                })
+
+        if not all_labels:
+            # No batches were processed — return a degenerate metrics dict
+            return {
+                'eer': 50.0, 'eer_threshold': 0.5, 'min_dcf': 1.0,
+                'accuracy': 0.0, 'bonafide_acc': 0.0, 'spoof_acc': 0.0,
+                'precision': 0.0, 'recall': 0.0, 'f1': 0.0, 'loss': float('nan')
+            }
+
+        all_labels = np.concatenate(all_labels)
+        all_scores = np.concatenate(all_scores)
+        all_preds  = np.concatenate(all_preds)
+        metrics = MetricsCalculation.compute_all_metrics(all_labels, all_scores, all_preds)
+        metrics['loss'] = total_loss / num_batches if num_batches > 0 else float('nan')
+
+        return metrics
+
     def fit(self, train_loader, val_loader, num_epochs, early_stopping_patience=10, start_epoch=0):
 
         print(f"Starting Training: {self.experiment_name}")
@@ -1588,52 +1690,40 @@ class TrainAASIST3:
         for epoch in range(start_epoch, num_epochs):
             self.current_epoch = epoch
 
-            # Resume safety: ensure frontend is unfrozen if we start past the warmup period
-            if epoch >= self.freeze_frontend_epochs and self.freeze_frontend_epochs > 0:
-                for param in self.model.frontend.parameters():
-                    if not param.requires_grad:
-                        print(f"\n[Frontend] Ensuring SincConv frontend is unfrozen (Epoch {epoch+1} >= Warmup {self.freeze_frontend_epochs})")
-                        param.requires_grad = True
-                        break # Only print once
-                # Re-ensure all params are unfrozen silently
-                for param in self.model.frontend.parameters():
-                    param.requires_grad = True
 
-            # Unfreeze the SincConv frontend after warmup period
-            if epoch == self.freeze_frontend_epochs and self.freeze_frontend_epochs > 0:
-                print(f"\n[Frontend] Unfreezing SincConv frontend at epoch {epoch + 1}. Full end-to-end training begins.")
-                for param in self.model.frontend.parameters():
-                    param.requires_grad = True
             
             train_loss, train_acc, train_bn_acc, train_sp_acc, grad_stats, overfit_stats = self.train_epoch(train_loader)
             
+            # Use the same crop-and-pad pipeline as training so the validation
+            # metric is comparable.  validate_sliding_window() is reserved for
+            # post-training inference on real-world audio.
             val_metrics = self.validate(val_loader)
             self.last_val_metrics = val_metrics
             
             self.history['train_loss'].append(train_loss)
             self.history['train_acc'].append(train_acc)
-            self.history['val_loss'].append(val_metrics['loss'])
-            self.history['val_eer'].append(val_metrics['eer'])
-            self.history['val_min_dcf'].append(val_metrics['min_dcf'])
-            self.history['val_accuracy'].append(val_metrics['accuracy'])
+            self.history['val_loss'].append(val_metrics.get('loss', 0.0))
+            self.history['val_eer'].append(val_metrics.get('eer', float('inf')))
+            self.history['val_min_dcf'].append(val_metrics.get('min_dcf', float('inf')))
+            self.history['val_accuracy'].append(val_metrics.get('accuracy', 0.0))
             
-            gap = train_acc - val_metrics['accuracy']
+            gap = train_acc - val_metrics.get('accuracy', 0.0)
             print(f"\n" + "-"*40)
             print(f" EPOCH {epoch+1}/{num_epochs} METRICS SUMMARY")
             print(f" " + "-"*40)
             print(f" Metric      | Training | Validation")
             print(f" " + "-"*38)
-            print(f" Loss        | {train_loss:8.4f} | {val_metrics['loss']:10.4f}")
-            print(f" Total Acc   | {train_acc:7.2f}% | {val_metrics['accuracy']:9.2f}%")
-            print(f" Bonafide Acc| {train_bn_acc:7.2f}% | {val_metrics['bonafide_acc']:9.2f}%")
-            print(f" Spoof Acc   | {train_sp_acc:7.2f}% | {val_metrics['spoof_acc']:9.2f}%")
+            print(f" Loss        | {train_loss:8.4f} | {val_metrics.get('loss', 0.0):10.4f}")
+            print(f" Total Acc   | {train_acc:7.2f}% | {val_metrics.get('accuracy', 0.0):9.2f}%")
+            print(f" Bonafide Acc| {train_bn_acc:7.2f}% | {val_metrics.get('bonafide_acc', 0.0):9.2f}%")
+            print(f" Spoof Acc   | {train_sp_acc:7.2f}% | {val_metrics.get('spoof_acc', 0.0):9.2f}%")
             print(f" Train-Val G | {gap:^8.2f}% | {'N/A':^10}")
-            print(f" EER         | {'N/A':^8} | {val_metrics['eer']:9.2f}%")
-            print(f" minDCF      | {'N/A':^8} | {val_metrics['min_dcf']:10.4f}")
+            print(f" EER         | {'N/A':^8} | {val_metrics.get('eer', float('inf')):9.2f}%")
+            print(f" minDCF      | {'N/A':^8} | {val_metrics.get('min_dcf', float('inf')):10.4f}")
             print(f" " + "-"*40)
             print(f" GRADIENT STATS: Avg: {grad_stats['avg']:.3f} | Min: {grad_stats['min']:.3f} | Max: {grad_stats['max']:.3f}")
             print(f" " + "-"*40)
-            
+
             if self.scheduler is not None:
                 if isinstance(self.scheduler, ReduceLROnPlateau):
                     self.scheduler.step(val_metrics['eer'])
@@ -1643,7 +1733,7 @@ class TrainAASIST3:
                 current_lr = self.optimizer.param_groups[0]['lr']
                 print(f"  Learning Rate: {current_lr:.6f}")
             
-            is_best = (val_metrics['eer'] < self.best_eer)
+            is_best = (val_metrics.get('min_dcf', float('inf')) < self.best_min_dcf)
             self.save_checkpoint(epoch + 1, is_best=is_best)
             
             current_lr = self.optimizer.param_groups[0]['lr']
@@ -1666,9 +1756,9 @@ class TrainAASIST3:
             )
             
             if is_best:
-                self.best_eer = val_metrics['eer']
-                self.best_min_dcf = val_metrics['min_dcf']
-                print(f"  [BEST] New best model saved (EER: {self.best_eer:.2f}%)")
+                self.best_eer = val_metrics.get('eer', float('inf'))
+                self.best_min_dcf = val_metrics.get('min_dcf', float('inf'))
+                print(f"  [BEST] New best model saved (minDCF: {self.best_min_dcf:.4f}, EER: {self.best_eer:.2f}%)")
                 patience_counter = 0
             else:
                 patience_counter += 1
@@ -1792,10 +1882,6 @@ class TrainAASIST3:
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         
-        new_wd = self.training_config.get('weight_decay', 0.01)
-        for group in self.optimizer.param_groups:
-            group['weight_decay'] = new_wd
-        
         if 'scheduler_state_dict' in checkpoint and self.scheduler is not None:
             self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         
@@ -1836,8 +1922,7 @@ def count_parameters(model):
             trainable += p.numel()
     return {
         'total': total,
-        'trainable': trainable,
-        'frozen': total - trainable
+        'trainable': trainable
     }
 
 def print_training_summary(args, model, criterion, device, optimizer):
@@ -1857,14 +1942,12 @@ def print_training_summary(args, model, criterion, device, optimizer):
         ("Learning Rate", args.lr),
         ("Use AMP", not args.disable_amp),
         ("Max Length (frames)", args.max_len),
-        ("Weight Decay", optimizer.param_groups[0]['weight_decay']),
         ("Patience", args.patience),
         ("Loss Function", criterion.__class__.__name__),
-        ("Optimizer", "AdamW"),
+        ("Optimizer", "Adam"),
         ("-" * 20, "-" * 30),
         ("Total Parameters", f"{params['total']:,}"),
         ("Trainable Params", f"{params['trainable']:,}"),
-        ("Frozen Params", f"{params['frozen']:,}"),
     ]
     
     for label, value in summary_data:
@@ -1988,95 +2071,80 @@ class AASIST3Inference:
         
         return np.mean(scores)
 
-
 def run_raw_training():
     import argparse
     from torch.utils.data import DataLoader
-    
+
     parser = argparse.ArgumentParser(description="AASIST3 Raw Waveform Training")
-    # Updated to your new dataset location
-    dataset_root = r"C:\Users\HazCodes\Documents\Datasets\ASVspoof5"
-    
+    dataset_root  = r"M:\Datasets\ASVspoof5"
+    default_results = r"M:\Results\ASVspoof5"
+
     parser.add_argument("--train_audio_dir", type=str, default=os.path.join(dataset_root, "flac_T"))
-    parser.add_argument("--train_protocol", type=str, default=os.path.join(dataset_root, "ASVspoof5.train.tsv"))
-    parser.add_argument("--dev_audio_dir", type=str, default=os.path.join(dataset_root, "flac_D"))
-    parser.add_argument("--dev_protocol", type=str, default=os.path.join(dataset_root, "ASVspoof5.dev.track_1.tsv"))
-    
-    default_results = r"N:\ASV5"
-    parser.add_argument("--checkpoint_dir", type=str, default=default_results,
-                        help="Root results directory. Outputs go to <dir>/<experiment_name>/. "
-                             f"Default: {default_results}")
-    parser.add_argument("--experiment_name", type=str, default="aasist3_raw_v1")
-    parser.add_argument("--epochs", type=int, default=30,
-                        help="Total number of epochs to train.")
-    parser.add_argument("--start_epoch", type=int, default=0,
-                        help="Epoch to start/resume training from.")
-    parser.add_argument("--resume", type=str, default=None,
-                        help="Path to a .pth checkpoint to resume training from.")
-    parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--max_len", type=int, default=64600, help="~4s audio at 16kHz (ASVspoof standard: 64600 samples)")
-    parser.add_argument("--num_workers", type=int, default=0)
-    parser.add_argument("--patience", type=int, default=15)
-    parser.add_argument("--subset", type=int, default=None)
-    parser.add_argument("--accumulation_steps", type=int, default=2)
-    parser.add_argument("--disable_amp", action="store_true")
-    parser.add_argument("--weight_decay", type=float, default=0.05)
-    parser.add_argument("--max_grad_norm", type=float, default=1.0,
-                        help="Max gradient norm for clipping. Default: 1.0")
-    parser.add_argument("--freeze_frontend_epochs", type=int, default=2,
-                        help="Freeze SincConv frontend for first N epochs to stabilize encoder training.")
-    parser.add_argument("--use_ce_loss", action="store_true",
-                        help="Use plain CrossEntropyLoss instead of CombinedLoss (FocalLoss).")
-    parser.add_argument("--ce_pos_weight", type=float, default=3.0,
-                        help="Pos weight for bonafide class in CrossEntropyLoss.")
+    parser.add_argument("--train_protocol",  type=str, default=os.path.join(dataset_root, "ASVspoof5.train.tsv"))
+    parser.add_argument("--dev_audio_dir",   type=str, default=os.path.join(dataset_root, "flac_D"))
+    parser.add_argument("--dev_protocol",    type=str, default=os.path.join(dataset_root, "ASVspoof5.dev.track_1.tsv"))
+    parser.add_argument("--checkpoint_dir",  type=str, default=default_results)
+    parser.add_argument("--experiment_name", type=str, default="aasist3")
+    parser.add_argument("--epochs",          type=int, default=30)
+    parser.add_argument("--start_epoch",     type=int, default=0)
+    parser.add_argument("--batch_size",      type=int, default=12)
+    parser.add_argument("--resume",          type=str, default=None)
+    parser.add_argument("--lr",              type=float, default=1e-4)
+    parser.add_argument("--max_len",         type=int, default=64600)
+    parser.add_argument("--num_workers",     type=int, default=0)
+    parser.add_argument("--patience",        type=int, default=15)
+    parser.add_argument("--subset",          type=int, default=None)
+    parser.add_argument("--accumulation_steps", type=int, default=1)
+    parser.add_argument("--disable_amp",     action="store_true", default=True, help="Disable AMP (SincConv overflows in float16).")
+    parser.add_argument("--max_grad_norm",   type=float, default=1.0)
     args = parser.parse_args()
 
-    resume_epoch = 0
-    
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
+    # ── Datasets ──────────────────────────────────────────────────────────────
     print("Loading datasets...")
-    train_dataset = RawASV5Dataset(args.train_audio_dir, args.train_protocol, max_len=args.max_len, is_train=True)
-    dev_dataset = RawASV5Dataset(args.dev_audio_dir, args.dev_protocol, max_len=args.max_len, is_train=False)
-    
-    bonafide_w, spoof_w = train_dataset.get_class_weights()
-    print(f"[Info] Class imbalance — Bonafide weight: {bonafide_w:.2f}, Spoof weight: {spoof_w:.2f}")
+    train_dataset = RawASV5Dataset(
+        args.train_audio_dir, args.train_protocol,
+        max_len=args.max_len, is_train=True, strict_labels=True
+    )
+    dev_dataset = RawASV5Dataset(
+        args.dev_audio_dir, args.dev_protocol,
+        max_len=args.max_len, is_train=False, strict_labels=False
+    )
 
+    # ── Optional subset ───────────────────────────────────────────────────────
     if args.subset:
-        train_indices = torch.randperm(len(train_dataset))[:args.subset]
-        train_dataset = torch.utils.data.Subset(train_dataset, train_indices)
-        
-        dev_indices = torch.randperm(len(dev_dataset))[:args.subset]
-        dev_dataset = torch.utils.data.Subset(dev_dataset, dev_indices)
-        print(f"Using subset of {args.subset} training and validation samples.")
+        train_dataset = torch.utils.data.Subset(
+            train_dataset, torch.randperm(len(train_dataset))[:args.subset]
+        )
+        dev_dataset = torch.utils.data.Subset(
+            dev_dataset, torch.randperm(len(dev_dataset))[:args.subset]
+        )
+        print(f"Using subset of {args.subset} samples for train and dev.")
 
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True)
-    dev_loader = DataLoader(dev_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
+    train_loader = DataLoader(
+        train_dataset, batch_size=args.batch_size,
+        shuffle=True, num_workers=args.num_workers, pin_memory=True
+    )
+    dev_loader = DataLoader(
+        dev_dataset, batch_size=args.batch_size,
+        shuffle=False, num_workers=args.num_workers, pin_memory=True
+    )
 
+    # ── Model ─────────────────────────────────────────────────────────────────
     print("Initializing AASIST3_Raw model...")
     model = AASIST3_Raw(frontend_out_channels=128).to(device)
 
-    # Freeze the SincConv frontend for the first N epochs
-    if args.freeze_frontend_epochs > 0:
-        print(f"Freezing SincConv frontend for first {args.freeze_frontend_epochs} epochs...")
-        for param in model.frontend.parameters():
-            param.requires_grad = False
-    
-    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 
-    if args.use_ce_loss:
-        ce_weight = torch.tensor([args.ce_pos_weight, 1.0]).to(device)
-        criterion = nn.CrossEntropyLoss(weight=ce_weight, label_smoothing=0.05)
-        print(f"Using CrossEntropyLoss with weights [bonafide={args.ce_pos_weight:.1f}, spoof=1.0]")
-    else:
-        # Fallback to combined loss
-        criterion = CombinedLoss(class_weights=[bonafide_w, spoof_w], label_smoothing=0.05).to(device)
-        print("Using CombinedLoss (FocalLoss + CE)")
-    
-    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
+    # ── Loss ──────────────────────────────────────────────────────────────────
+    # Paper (Section 3.10): "regular cross-entropy was indeed efficacious.
+    # Focal loss, weighted CE, and scheduler all proved ineffective."
+    criterion = nn.CrossEntropyLoss()
+    print(f"Loss: CrossEntropyLoss")
 
+    # ── Trainer ───────────────────────────────────────────────────────────────
     metadata = print_training_summary(args, model, criterion, device, optimizer)
     print_model_summary(model, device, input_size=(1, 1, args.max_len))
     torch.cuda.empty_cache()
@@ -2086,39 +2154,41 @@ def run_raw_training():
         optimizer=optimizer,
         criterion=criterion,
         device=device,
-        scheduler=scheduler,
+        scheduler=None,
         checkpoint_dir=args.checkpoint_dir,
         experiment_name=args.experiment_name,
         accumulation_steps=args.accumulation_steps,
         use_amp=not args.disable_amp,
-        max_grad_norm=args.max_grad_norm
+        max_grad_norm=args.max_grad_norm,
+        max_len=args.max_len,
+        sample_rate=16000,
     )
     trainer.training_config = metadata
-    trainer.freeze_frontend_epochs = args.freeze_frontend_epochs
+
+    resume_epoch = 0
     if args.resume:
         resume_epoch = trainer.load_checkpoint(args.resume)
-        print(f"  Will resume from epoch {resume_epoch + 1} → {args.epochs}")
-    
+        print(f"Resuming from epoch {resume_epoch + 1} → {args.epochs}")
+
     start_epoch = args.start_epoch if args.start_epoch > 0 else resume_epoch
 
+    # ── Train ─────────────────────────────────────────────────────────────────
     try:
         trainer.fit(
-            train_loader,
-            dev_loader,
+            train_loader, dev_loader,
             num_epochs=args.epochs,
             early_stopping_patience=args.patience,
-            start_epoch=start_epoch
+            start_epoch=start_epoch,
         )
     except Exception as e:
         import traceback
         error_msg = traceback.format_exc()
-        print("FATAL ERROR CAUGHT:")
-        print(error_msg)
-        
+        print("FATAL ERROR CAUGHT:\n", error_msg)
         log_path = os.path.join(os.getcwd(), "debug_error.txt")
         with open(log_path, "w") as f:
             f.write(error_msg)
-        raise e
+        raise
+
 
 if __name__ == "__main__":
     run_raw_training()
