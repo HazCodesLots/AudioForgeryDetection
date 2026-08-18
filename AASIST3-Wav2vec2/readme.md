@@ -1,6 +1,9 @@
 # AASIST3-Wav2Vec2: Self-Supervised Graph Attention with Kolmogorov-Arnold Networks
 
-An end-to-end deepfake speech detection architecture combining pre-trained Self-Supervised Learning (SSL) representations, Kolmogorov-Arnold Networks (KAN), and Heterogeneous Spectro-Temporal Graph Attention (HS-GAL) for audio anti-spoofing under the **ASVspoof 5 Track 1** protocol.
+An end-to-end deepfake speech detection architecture combining pre-trained Self-Supervised Learning (SSL) representations, Kolmogorov-Arnold Networks (KAN), and Heterogeneous Spectro-Temporal Graph Attention (HS-GAL) for audio anti-spoofing under the **ASVspoof 5 Track 1** protocol. 
+
+[AASIST3: KAN-Enhanced AASIST Speech Deepfake Detection using SSL
+Features and Additional Regularization for the ASVspoof 2024 Challenge](https://arxiv.org/pdf/2408.17352)
 
 ---
 
@@ -13,16 +16,16 @@ All metrics are evaluated under the official Track 1 evaluation protocol across 
 | **Development (Epoch 13)** | **6.79%** | — | **84.23%** | 99.46% | 79.88% |
 | **Evaluation Set (Full, 681k files)** | **8.5869%** | **0.2195** | — | — | — |
 
-- **Official Track 1 minDCF Parameterization**: $C_{\text{miss}} = 1$, $C_{\text{fa}} = 10$, $\pi_{\text{spf}} = 0.05 \implies \beta = 1.90$, with $\text{DCF}(\tau) = \beta \cdot P_{\text{miss}}(\tau) + P_{\text{fa}}(\tau)$.
 - **Operating Threshold (EER)**: $\tau_{\text{EER}} = 0.025565$.
 
-### 📈 Training Progression (20 Epochs)
+### 📈 Training Metrics (20 Epochs)
 
-![AASIST3-Wav2Vec2 Training Progression](training_metrics.png)
+<img width="3870" height="2670" alt="training_metrics" src="https://github.com/user-attachments/assets/026c1971-fca2-47f7-9173-083e987e1f54" />
+
 
 ---
 
-## 🧠 Architectural Overview
+## Architectural Overview
 
 ```text
 Raw Audio Waveform (16 kHz)
@@ -65,10 +68,10 @@ Raw Audio Waveform (16 kHz)
 
 ---
 
-## ⚙️ Key Architectural Components
+## Architectural Components
 
 ### 1. Fine-Tuned Self-Supervised Frontend
-Replaces traditional sinc-convolutions and engineered spectrograms with `facebook/wav2vec2-base`. The 7-layer convolutional feature encoder and bottom 6 transformer layers remain frozen to preserve foundational acoustic representations, while the top 6 transformer layers (layers 6–11) are unfrozen and fine-tuned discriminatively at a low learning rate ($5 \times 10^{-6}$).
+The 7-layer convolutional feature encoder and bottom 6 transformer layers remain frozen to preserve foundational acoustic representations, while the top 6 transformer layers (layers 6–11) are unfrozen and fine-tuned discriminatively at a low learning rate ($5 \times 10^{-6}$).
 
 ### 2. Kolmogorov-Arnold Network (KAN) Layers
 Replaces standard Multi-Layer Perceptrons with learnable 1D B-spline basis function activations:
@@ -83,13 +86,13 @@ Constructs two parallel graph topologies from the projected feature sequence:
 - **Stack Memory Node ($S$)**: A learnable global accumulator facilitating bi-directional message exchange between temporal and spatial sub-graphs.
 
 ### 4. Multi-Branch Progressive Graph Coarsening
-Processes representations across 4 parallel branches with hierarchical top-$k$ graph pooling, systematically distilling fine-grained acoustic artifacts into high-level topological embeddings before multi-scale readout aggregation.
+Processes representations across 4 parallel branches with hierarchical top-k graph pooling, systematically distilling fine-grained acoustic artifacts into high-level topological embeddings before multi-scale readout aggregation.
 
 ---
 
-## 🛠️ Execution & Reproduction
+## Execution & Reproduction
 
-### 1. Model Training
+### Model Training
 ```bash
 python AASIST3-Wav2vec2/AASIST3_Wav2Vec2.py \
     --batch_size 24 \
@@ -106,16 +109,16 @@ python AASIST3-Wav2vec2/AASIST3_Wav2Vec2.py \
     --epochs 30
 ```
 
-### 2. Evaluation Set Scoring (Sliding-Window Inference)
-Generates per-utterance bonafide probabilities using 4.0s windows with 2.0s overlap across the 681k evaluation set files:
+### Sliding-Window Inference Scoring
 ```bash
-python AASIST3-Wav2vec2/evaluate_eval_set.py
+python AASIST3-Wav2vec2/evaluate_eval_set.py \
+    --eval_dir path/to/eval_flac/ \
+    --checkpoint path/to/checkpoint.pth
 ```
 
-### 3. Metric Computation (EER & minDCF)
-Computes official ASVspoof 5 Track 1 metrics against ground truth protocols and exports JSON results:
+### Official Track 1 Metric Computation (EER & minDCF)
 ```bash
 python AASIST3-Wav2vec2/calculate_eval_eer.py \
-    --scores "M:/Results/ASVspoof5/AASIST3Wav2Vec2/aasist3_wav2vec2/eval_scores_epoch13.txt" \
-    --protocol "M:/Datasets/ASVspoof5/ASVspoof5.eval.track_1.tsv"
+    --scores path/to/eval_scores.txt \
+    --protocol path/to/ASVspoof5.eval.track_1.tsv
 ```
