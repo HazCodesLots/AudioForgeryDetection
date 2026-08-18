@@ -44,11 +44,20 @@ def _single_item_collate(batch):
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="AASIST3-Wav2Vec2 Sliding-Window Evaluation")
+    parser.add_argument("--eval_dir", type=str, default=r"M:\Datasets\ASVspoof5\flac_E",
+                        help="Path to folder containing evaluation .flac files")
+    parser.add_argument("--checkpoint", type=str, default=r"M:\Results\ASVspoof5\AASIST3Wav2Vec2\aasist3_wav2vec2\Checkpoints\AASIST3_Epoch13.pth",
+                        help="Path to model checkpoint .pth file")
+    parser.add_argument("--output", type=str, default=None,
+                        help="Output path for scores .txt file (auto-derived if not specified)")
+    args = parser.parse_args()
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
     print("Loading model...")
-    # Initialize with the exact architecture args used for training
     model = AASIST3_Wav2Vec2(
         wav2vec2_model_name="facebook/wav2vec2-base",
         freeze_feature_extractor=True,
@@ -60,7 +69,7 @@ def main():
         num_branches=4,
     )
 
-    checkpoint_path = r"M:\Results\ASVspoof5\AASIST3Wav2Vec2\aasist3_wav2vec2\Checkpoints\AASIST3_Epoch13.pth"
+    checkpoint_path = args.checkpoint
     print(f"Loading checkpoint: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location=device)
 
@@ -72,23 +81,24 @@ def main():
     model = model.to(device)
     model.eval()
 
-    eval_dir = r"M:\Datasets\ASVspoof5\flac_E"
+    eval_dir = args.eval_dir
     dataset = EvalDataset(eval_dir)
     print(f"Found {len(dataset)} flac files to evaluate.")
 
-    # batch_size=1 at the file level: each utterance yields a variable number
-    # of windows, which are batched through the model per-file below instead
-    # of batching across files.
     loader = DataLoader(
         dataset, batch_size=1, num_workers=4, shuffle=False,
         collate_fn=_single_item_collate,
     )
 
-    # Derive scores filename from checkpoint so it always matches the epoch
-    import os, re
-    _ckpt_stem = os.path.splitext(os.path.basename(checkpoint_path))[0]  # e.g. AASIST3_Epoch13
-    _epoch_tag = re.sub(r'AASIST3_', '', _ckpt_stem).lower()             # e.g. epoch13
-    output_file = rf"M:\Results\ASVspoof5\AASIST3Wav2Vec2\aasist3_wav2vec2\eval_scores_{_epoch_tag}.txt"
+    if args.output:
+        output_file = args.output
+    else:
+        import os, re
+        _ckpt_stem = os.path.splitext(os.path.basename(checkpoint_path))[0]
+        _epoch_tag = re.sub(r'AASIST3_', '', _ckpt_stem).lower()
+        output_dir = os.path.dirname(os.path.dirname(checkpoint_path))
+        output_file = os.path.join(output_dir, f"eval_scores_{_epoch_tag}.txt")
+
     print(f"Writing scores to {output_file}")
     print(f"Sliding-window inference: {WINDOW_SECONDS}s window, {OVERLAP_SECONDS}s overlap")
 
