@@ -1,18 +1,25 @@
-## Overview
-A comprehensive training and evaluation framework for audio classification, speaker verification, and spoof detection with a variety of architectural configurations. The implementation is organized to enable scalable experimentation across feature types and augmentation, maintaining a clean separation between data preprocessing, model components, and training logic.  
+# Audio Forgery Detection
 
-### 📊 ConvNeXt-GAP  mAP: 0.30  SONYC-UST Urban Sound Tagging (23-class multi-label)
-### 📊 LFCC-LCNN Overall EER: 0.5129% WaveFake LeaveOneVocoderOut Evaluation
-### 📊 LFCC-LCNN Overall EER: 0.3817% WaveFake 80/20 Test Evaluation
-### 📊 RawGAT-ST Overall EER: 2.45%, min‑tDCF: 0.1713 ASVspoof2019 Evaluation set (Closed condition)  
-### 📊 ResNet-18 Overall EER: 1.41% LFCC 80/20 split  ODSS Validation set
-### 📊 ResNet-18 Overall EER: 3.15% MFCC 80/20 split  ODSS Validation set
-### **Detailed architectures, explanations, and training metrics are provided in the respective sub-folder READMEs.**
+[![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat&logo=python&logoColor=white)](https://www.python.org/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-EE4C2C?style=flat&logo=pytorch&logoColor=white)](https://pytorch.org/)
+[![Benchmarks](https://img.shields.io/badge/Benchmarks-ASVspoof5%20%7C%20ASVspoof2019%20%7C%20WaveFake%20%7C%20ODSS-blue)](https://www.asvspoof.org/)
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-![Python](https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white)
-![PyTorch](https://img.shields.io/badge/PyTorch-EE4C2C?style=for-the-badge&logo=pytorch&logoColor=white)
-![CUDA](https://img.shields.io/badge/CUDA-76B900?style=for-the-badge&logo=nvidia&logoColor=white)
-![NumPy](https://img.shields.io/badge/NumPy-013243?style=for-the-badge&logo=numpy&logoColor=white)
-![Matplotlib](https://img.shields.io/badge/Matplotlib-11557C?style=for-the-badge&logo=python&logoColor=white)
-![Librosa](https://img.shields.io/badge/Librosa-FF6600?style=for-the-badge&logo=python&logoColor=white)
-![Torchaudio](https://img.shields.io/badge/Torchaudio-EE4C2C?style=for-the-badge&logo=pytorch&logoColor=white)
+A modular deep learning framework spanning a broad cross-section of audio anti-spoofing and synthetic speech forensics, organizing a diverse hierarchy of model architectures, feature extraction pipelines, augmentation strategies, and parameter configurations to enable extensive experimentation into how fundamentally different methodological approaches can be formulated and applied to solve the same detection task.
+
+## 🗂️ Sub-Module Documentation
+
+
+- 🔗 **[AASIST3-Wav2Vec2](AASIST3-Wav2vec2/readme.md)**  
+  *Audio Anti-Spoofing with Kolmogorov-Arnold Networks (KAN) & SSL Wav2Vec 2.0 on ASVspoof5 Track 1.*
+
+- 🔗 **[RawGAT-ST](RawGAT-ST/README.md)**  
+  *End-to-end raw waveform processing via SincNet filterbanks and dual-stream spectral-temporal Graph Attention Networks on ASVspoof 2019 LA.*
+
+- 🔗 **[LFCC-LCNN](LFCC-LCNN/README.md)**  
+  *Linear Frequency Cepstral Coefficients combined with Light CNN (Max-Feature-Map activation) evaluated on the WaveFake multi-vocoder benchmark.*
+
+- 🔗 **[ResNet-SE](ResNet/README.md)**  
+  *ResNet-18 augmented with Squeeze-and-Excitation channel attention across LFCC and MFCC acoustic feature spaces.*
+
+---
