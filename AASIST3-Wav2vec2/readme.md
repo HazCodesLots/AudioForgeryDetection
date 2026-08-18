@@ -1,161 +1,121 @@
-AASIST and what I understand from reading the research paper  
+# AASIST3-Wav2Vec2: Self-Supervised Graph Attention with Kolmogorov-Arnold Networks
 
-# AASIST: Audio Anti-Spoofing using Integrated Spectro-Temporal Graph Attention Networks
+An end-to-end deepfake speech detection architecture combining pre-trained Self-Supervised Learning (SSL) representations, Kolmogorov-Arnold Networks (KAN), and Heterogeneous Spectro-Temporal Graph Attention (HS-GAL) for audio anti-spoofing under the **ASVspoof 5 Track 1** protocol.
 
-Spoofing artifacts that distinguish fake audio from genuine speech can appear in different forms:
+---
 
-- Spectral artifacts: Anomalies in specific frequency bands or sub-bands
-- Temporal artifacts: Irregularities in time-domain patterns and transitions
-- Hybrid artifacts: Complex patterns spanning both domains
+## 📊 Benchmark Results (ASVspoof 5 Track 1)
 
-AASIST learns these patterns through integrated spectro-temporal modeling.
+All metrics are evaluated under the official Track 1 evaluation protocol across **681,872 evaluation audio files** (680,774 official protocol trials) using 4.0-second sliding-window inference with 2.0-second overlap.
 
-```text
-Input: Raw Waveform
-         ↓
-    RawNet2 Encoder
-         ↓
-   Max Pooling Split
-         ↓
-    ┌────┴────┐
-    ↓         ↓
-Temporal   Spectral
- Graph      Graph
-   (Gt)      (Gs)
-    └────┬────┘
-         ↓
-    HS-GAL Layer
-    (Heterogeneous
-     Attention +
-     Stack Node)
-         ↓
-  Max Graph Op (MGO)
-         ↓
-    Readout Layer
-    [Max|Mean|Stack]
-         ↓
-   Classification
-```
+| Evaluation Subset | EER (%) | minDCF ($\beta=1.90$) | Accuracy (%) | Bonafide Acc (%) | Spoof Acc (%) |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **Development (Epoch 13)** | **6.79%** | — | **84.23%** | 99.46% | 79.88% |
+| **Evaluation Set (Full, 681k files)** | **8.5869%** | **0.2195** | — | — | — |
 
-# AASIST Architecture
+- **Official Track 1 minDCF Parameterization**: $C_{\text{miss}} = 1$, $C_{\text{fa}} = 10$, $\pi_{\text{spf}} = 0.05 \implies \beta = 1.90$, with $\text{DCF}(\tau) = \beta \cdot P_{\text{miss}}(\tau) + P_{\text{fa}}(\tau)$.
+- **Operating Threshold (EER)**: $\tau_{\text{EER}} = 0.025565$.
 
-  ## Architecture Overview
+### 📈 Training Progression (20 Epochs)
 
-#### RawNet2-based encoder
+![AASIST3-Wav2Vec2 Training Progression](training_metrics.png)
 
-The RawNet2-based encoder extracts high level representations with dimensions C (channels), S (spectral bins), and T (temporal sequence length) directly from raw waveforms. However, the RawNet2 used in AASIST is modified to output F ∈ ℝ^{C×S×T} which is reorganized via Max pooling into graph node features, with separate temporal and spectral node representations.  
+---
 
-#### Heterogeneous Stacking Graph Attention Layer (HS-GAL)
-
-The HS-GAL (Heterogeneous Stacking of Graph Attention Layers) seems to be the core component of this architecture, consisting of:
-
-##### Heterogeneous Attention
-- Temporal Nodes (Gt): Capture time-domain features and temporal patterns
-- Spectral Nodes (Gs): Model frequency-domain characteristics and spectral anomalies
-
-##### Stack Node
-- Aggregates information from both temporal and spectral domains
-
-#### Max Graph Operation
-
-The Max Graph Operation (MGO) introduces a selection mechanism that aggregates node features by taking element-wise maxima across graph representations, allowing AASIST to emphasize the most discriminative spoofing-related activations while suppressing less informative responses in both temporal and spectral domains.
-
-#### Readout
-
-An extended aggregation that concatenates max, mean, and stack node graph level summaries.  
-
-### Benchmarks (from the paper)
-
-<img width="335" height="88" alt="image" src="https://github.com/user-attachments/assets/3af4498a-6691-4842-801f-03b77db290fe" />
-
-| # Parameters | Front-end     | Architecture | min t-DCF | EER (%) |
-|-------------|---------------|-------------|-----------|---------|
-| 297K        | Raw waveform  | AASIST      | 0.0275    | 0.83    |
-| 85K         | Raw waveform  | AASIST-L    | 0.0309    | 0.99    |
-
- # AASIST3: Graph Attention Anti-Spoofing with Kolmogorov-Arnold Networks
-A state-of-the-art audio deepfake detection model combining graph neural networks, heterogeneous attention mechanisms, and Kolmogorov-Arnold Network (KAN) layers for robust spoofing detection.
-
-Overview
-AASIST3 (Anti-Spoofing using Attention and Stack with KAN Integration) extends graph-based audio forensics by replacing traditional MLPs with KAN layers that use learnable B-spline basis functions for more expressive non-linear transformations.
-
-KAN-based Graph Attention (KAN-GAL): Replaces standard linear projections with adaptive spline-based transformations for improved feature learning.​
-
-Heterogeneous Temporal-Spatial Graphs: Constructs dual graph representations capturing both temporal patterns and spectral relationships.​
-
-Multi-Branch Hierarchical Pooling: Progressive graph coarsening across 4 branches with learnable stack aggregation.​
-
-Gradient-Aware Training: Real-time gradient health monitoring with automatic overfitting detection during training.
+## 🧠 Architectural Overview
 
 ```text
-Input (Mel Spectrogram 128×T)
-    ↓
-┌─────────────────────────────────┐
-│ AASIST3 Encoder (6 ResBlocks)   │  → Feature maps (256×T')
-└─────────────────────────────────┘
-    ↓
-┌─────────────────────────────────┐
-│ Graph Formation Module          │
-│  • Temporal Graph (KAN-GAL)     │  → h_t (100 nodes × 64 dim)
-│  • Spatial Graph (KAN-GAL)      │  → h_s (100 nodes × 64 dim)
-└─────────────────────────────────┘
-    ↓
-┌─────────────────────────────────┐
-│ Multi-Branch Architecture (×4)  │
-│  Each Branch:                   │
-│   • KAN_HS_GAL (Hetero Attn)    │
-│   • KAN_GraphPool               │
-│   • Stack Node Fusion           │
-└─────────────────────────────────┘
-    ↓
-┌─────────────────────────────────┐
-│ Global Aggregation              │
-│  • Max/Mean pooling per branch  │
-│  • Stack aggregation            │
-└─────────────────────────────────┘
-    ↓
-Output Head (KAN-based) → Logits (2 classes)
+Raw Audio Waveform (16 kHz)
+             ↓
+┌─────────────────────────────────────────────────────────────┐
+│ Wav2Vec 2.0 Frontend (facebook/wav2vec2-base)               │
+│  • CNN Feature Extractor (Frozen)                           │
+│  • Transformer Layers 0–5 (Frozen)                          │
+│  • Transformer Layers 6–11 (Trainable, LR = 5e-6)           │
+└─────────────────────────────────────────────────────────────┘
+             ↓ Latent Frame Embeddings (768 dim)
+┌─────────────────────────────────────────────────────────────┐
+│ Dimension Projection & Graph Formation                      │
+│  • Linear Projection (768 → 256 dim)                        │
+│  • Temporal Graph ($G_t$): 25 nodes                         │
+│  • Spatial Graph ($G_s$): 25 nodes                          │
+└─────────────────────────────────────────────────────────────┘
+             ↓
+┌─────────────────────────────────────────────────────────────┐
+│ 4-Branch Hierarchical Heterogeneous Graph Module            │
+│  Each Branch:                                               │
+│   • KAN-HS-GAL (Spectral-Temporal Heterogeneous Attention)   │
+│   • Adaptive Graph Pooling (Node Coarsening)                │
+│   • Learnable Stack Memory Node ($S$)                        │
+└─────────────────────────────────────────────────────────────┘
+             ↓
+┌─────────────────────────────────────────────────────────────┐
+│ Readout & Global Aggregation                                │
+│  • Max + Mean temporal node pool                            │
+│  • Max + Mean spatial node pool                             │
+│  • Stack node representation concatenation                  │
+└─────────────────────────────────────────────────────────────┘
+             ↓
+┌─────────────────────────────────────────────────────────────┐
+│ KAN Classification Head                                     │
+│  • B-Spline Basis Function Layer (256 → 64 → 2)             │
+│  • Output: [Bonafide Logit, Spoof Logit]                    │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-# AASIST3 Architecture
+---
 
-  ## Architecture Overview
+## ⚙️ Key Architectural Components
 
-  
-#### KANLayer
-Implements Kolmogorov-Arnold representation using vectorized B-spline basis computation with dual-path activation (PReLU + spline).​
-Parameters:
-grid_size=16: Number of spline intervals
-spline_order=4: Polynomial degree
-grid_range=(-1,1): Input normalization range
+### 1. Fine-Tuned Self-Supervised Frontend
+Replaces traditional sinc-convolutions and engineered spectrograms with `facebook/wav2vec2-base`. The 7-layer convolutional feature encoder and bottom 6 transformer layers remain frozen to preserve foundational acoustic representations, while the top 6 transformer layers (layers 6–11) are unfrozen and fine-tuned discriminatively at a low learning rate ($5 \times 10^{-6}$).
 
-#### AASIST3 Encoder
-6-block ResNet-style encoder with:
-BatchNorm → SELU → Conv1D architecture
-Stride-3 downsampling at blocks 2, 4, 6
-Output: 256-channel feature maps​
+### 2. Kolmogorov-Arnold Network (KAN) Layers
+Replaces standard Multi-Layer Perceptrons with learnable 1D B-spline basis function activations:
+- **Grid Intervals**: `grid_size = 16`
+- **Spline Order**: `spline_order = 4` (cubic B-splines)
+- **Base Activation**: Dual-path PReLU + parametric spline curve
 
-#### Graph Formation
-Converts encoder features into dual graphs:  
-- Temporal graph: Captures time-series dependencies (adaptive max pooling → 100 nodes)
-- Spatial graph: Models frequency bin relationships (channel-wise pooling → 100 nodes)
-Each graph processed by KAN-GAL + KAN-GraphPool
-​
-#### KAN_HS_GAL (Heterogeneous Stack Graph Attention)
-Fuses temporal and spatial graphs using:  
-- Primary attention: Node-to-node message passing with heterogeneous edge weights
-- Stack attention: Learnable memory node aggregating cross-branch information
-​
+### 3. Heterogeneous Stacking Graph Attention (HS-GAL)
+Constructs two parallel graph topologies from the projected feature sequence:
+- **Temporal Graph ($G_t$)**: Captures time-domain boundary transitions and phase inconsistencies across 25 nodes.
+- **Spatial Graph ($G_s$)**: Models cross-channel and sub-band harmonic anomalies across 25 nodes.
+- **Stack Memory Node ($S$)**: A learnable global accumulator facilitating bi-directional message exchange between temporal and spatial sub-graphs.
 
-#### Multi-Branch Architecture
-4 cascaded branches with progressive pooling (ratio=0.5):
+### 4. Multi-Branch Progressive Graph Coarsening
+Processes representations across 4 parallel branches with hierarchical top-$k$ graph pooling, systematically distilling fine-grained acoustic artifacts into high-level topological embeddings before multi-scale readout aggregation.
 
-- Branch 1: 100 → 50 nodes
+---
 
-- Branch 2: 50 → 25 nodes
+## 🛠️ Execution & Reproduction
 
-- Branch 3: 25 → 12 nodes
+### 1. Model Training
+```bash
+python AASIST3-Wav2vec2/AASIST3_Wav2Vec2.py \
+    --batch_size 24 \
+    --amp_dtype bf16 \
+    --num_temporal_nodes 25 \
+    --num_spatial_nodes 25 \
+    --unfreeze_top_n 6 \
+    --lr_backbone 1e-4 \
+    --lr_frontend 5e-6 \
+    --weight_decay 1e-4 \
+    --patience 10 \
+    --label_smoothing 0.05 \
+    --augment \
+    --epochs 30
+```
 
-- Branch 4: 12 → 6 nodes
+### 2. Evaluation Set Scoring (Sliding-Window Inference)
+Generates per-utterance bonafide probabilities using 4.0s windows with 2.0s overlap across the 681k evaluation set files:
+```bash
+python AASIST3-Wav2vec2/evaluate_eval_set.py
+```
 
-Final embedding: [H_max_t, H_mean_t, H_max_s, H_mean_s, S_max] → 256 dim
+### 3. Metric Computation (EER & minDCF)
+Computes official ASVspoof 5 Track 1 metrics against ground truth protocols and exports JSON results:
+```bash
+python AASIST3-Wav2vec2/calculate_eval_eer.py \
+    --scores "M:/Results/ASVspoof5/AASIST3Wav2Vec2/aasist3_wav2vec2/eval_scores_epoch13.txt" \
+    --protocol "M:/Datasets/ASVspoof5/ASVspoof5.eval.track_1.tsv"
+```
