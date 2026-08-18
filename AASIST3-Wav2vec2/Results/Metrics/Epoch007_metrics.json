@@ -1,0 +1,49 @@
+{
+    "experiment": "aasist3_wav2vec2",
+    "epoch": 7,
+    "total_epochs": 30,
+    "timestamp": "2026-08-12 22:15:59",
+    "train": {
+        "loss": 0.12329336534634062,
+        "accuracy": 99.81848791107552,
+        "bonafide_acc": 98.84556046177582,
+        "spoof_acc": 99.93030080704328,
+        "skipped_amp_steps": 0
+    },
+    "val": {
+        "loss": 1.3902762191306381,
+        "accuracy": 66.56473926924441,
+        "bonafide_acc": 99.9457458351631,
+        "spoof_acc": 57.022697416430354,
+        "eer": 13.141193187310984,
+        "eer_threshold": 0.0165863037109375,
+        "min_dcf": 0.5261963272296392,
+        "precision": 0.9997281000590184,
+        "recall": 0.5702269741643036,
+        "f1": 0.7262270560634599
+    },
+    "overfitting": {
+        "train_val_gap": 33.25374864183111,
+        "red_flag_count": 7499,
+        "max_gap_observed": 41.98095230899019
+    },
+    "gradient_stats": {
+        "avg": 0.5752051471180921,
+        "min": 0.009679200127720833,
+        "max": 153.62799072265625
+    },
+    "optimisation": {
+        "learning_rate": 5e-06
+    },
+    "bests": {
+        "is_best_epoch": false,
+        "best_eer_so_far": 8.57208793816283,
+        "best_min_dcf_so_far": 0.5170817124404516
+    },
+    "early_stopping": {
+        "patience_counter": 1,
+        "early_stopping_patience": 10,
+        "patience_remaining": 9
+    },
+    "checkpoint_saved": "M:\\Results\\ASVspoof5\\AASIST3Wav2Vec2\\aasist3_wav2vec2\\Checkpoints\\AASIST3_Epoch7.pth"
+}
