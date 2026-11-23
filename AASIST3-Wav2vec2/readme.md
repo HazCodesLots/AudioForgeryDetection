@@ -40,16 +40,16 @@ Raw Audio Waveform (16 kHz)
 ┌─────────────────────────────────────────────────────────────┐
 │ Dimension Projection & Graph Formation                      │
 │  • Linear Projection (768 → 256 dim)                        │
-│  • Temporal Graph ($G_t$): 25 nodes                         │
-│  • Spatial Graph ($G_s$): 25 nodes                          │
+│  • Temporal Graph (G_t): 25 nodes                           │
+│  • Spatial Graph (G_s): 25 nodes                            │
 └─────────────────────────────────────────────────────────────┘
              ↓
 ┌─────────────────────────────────────────────────────────────┐
 │ 4-Branch Hierarchical Heterogeneous Graph Module            │
 │  Each Branch:                                               │
-│   • KAN-HS-GAL (Spectral-Temporal Heterogeneous Attention)   │
+│   • KAN-HS-GAL (Spectral-Temporal Heterogeneous Attention)  │
 │   • Adaptive Graph Pooling (Node Coarsening)                │
-│   • Learnable Stack Memory Node ($S$)                        │
+│   • Learnable Stack Memory Node (S).                        │
 └─────────────────────────────────────────────────────────────┘
              ↓
 ┌─────────────────────────────────────────────────────────────┐
